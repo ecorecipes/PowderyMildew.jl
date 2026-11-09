@@ -1,0 +1,41 @@
+project:
+  type: default
+  render:
+    - "*/*.qmd"
+
+# quarto does not reliably apply a project-wide engine (quarto-cli#3157), so every .qmd
+# also sets `engine: julia` in its own front matter.
+engine: julia
+
+julia:
+  project: "."
+  # one GC thread: Julia 1.12's parallel GC with CHOLMOD has corrupted the heap in long runs
+  exeflags: ["--gcthreads=1"]
+
+format:
+  html:
+    theme: cosmo
+    toc: true
+    embed-resources: true
+  pdf:
+    documentclass: scrartcl
+    papersize: a4
+    mainfont: "STIX Two Text"
+    sansfont: "STIX Two Text"
+    monofont: "Menlo"
+    mathfont: "STIX Two Math"
+    pdf-engine: lualatex
+    toc: true
+    colorlinks: true
+    linkcolor: "blue"
+    urlcolor: "blue"
+    include-in-header:
+      text: |
+        \usepackage{fvextra}
+        \DefineVerbatimEnvironment{Highlighting}{Verbatim}{breaklines,breakanywhere,commandchars=\\\{\}}
+        \RecustomVerbatimEnvironment{verbatim}{Verbatim}{breaklines,breakanywhere}
+  gfm:
+    toc: true
+
+execute:
+  freeze: auto

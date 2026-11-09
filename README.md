@@ -1,5 +1,7 @@
 # PowderyMildew.jl
 
+[![Docs](https://img.shields.io/badge/docs-dev-blue.svg)](https://ecorecipes.github.io/PowderyMildew.jl/dev/)
+
 Seasonal, leaf-level models of oak powdery mildew (*Erysiphe alphitoides* on *Quercus robur* and
 *Q. petraea*), for asking how the timing of oak flushing and of primary inoculum shapes
 severity, and how climate change shifts it.
@@ -12,6 +14,13 @@ severity, and how climate change shifts it.
   secondary (conidial) and primary (ascospore) infection, weather forcing, and a winter map
   through chasmothecia. It nests the one-species Hamelin model exactly, and that limit is
   tested.
+- **The spatial model** (`SpatialMildewProblem`): the leaf-level model on a grid of oak stands,
+  coupled by two-scale dispersal (a share of conidia escapes the stand into a quasi-steady
+  screened-Poisson field), for the speed of spread and its dependence on the woodland.
+
+Tutorials (Quarto, in `vignettes/`, rendered to the
+[documentation](https://ecorecipes.github.io/PowderyMildew.jl/dev/)): the Hamelin model and its
+Table 2; timing and severity in the leaf-level model; spread.
 
 ```julia
 using PowderyMildew
