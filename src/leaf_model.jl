@@ -206,12 +206,16 @@ struct LeafRHS{F}
     forcing::F
 end
 
-function (r::LeafRHS)(du, u, _, t)
-    p, f = r.p, r.forcing
+(r::LeafRHS)(du, u, _, t) = leaf_rhs!(du, u, r.p, r.forcing, t, u[sporulating(r.p)])
+
+# One stand's right-hand side, with `conidia` the conidial pressure that multiplies b_c: the
+# stand's own sporulating leaves in the nonspatial model, a mix of local and dispersed spores in
+# the spatial one.
+function leaf_rhs!(du, u, p::MildewParameters, f, t, conidia)
     K, L = p.K, p.L
     iI, iC = sporulating(p), inoculum(p)
     g = f.pulse ? 0.0 : f.release(t)
-    λ = f.weather(t) * (p.b_c * u[iI] + p.b_a * g * u[iC] + p.b_ext)
+    λ = f.weather(t) * (p.b_c * conidia + p.b_a * g * u[iC] + p.b_ext)
     age = isinf(p.tau_s) ? 0.0 : K / p.tau_s
     susceptible = zero(eltype(u))
     @inbounds for k in 1:K
@@ -296,25 +300,33 @@ function CommonSolve.solve(prob::MildewProblem; alg = Tsit5(), abstol = 1e-12, r
     winter = Float64[]
     for f in prob.forcings
         u0 = zeros(nstate(p))
-        u0[1] = f.leaves0
-        if f.pulse
-            # release everything at t0: each leaf present escapes with probability exp(-b_a C)
-            infected = -expm1(-p.b_a * C * f.weather(f.tspan[1]))
-            u0[1] = f.leaves0 * (1 - infected)
-            u0[p.L == 0 ? sporulating(p) : first(latent_stages(p))] = f.leaves0 * infected
-        else
-            u0[inoculum(p)] = C
-        end
+        season_start!(u0, p, f, C)
         ode = ODEProblem(LeafRHS(p, f), u0, f.tspan)
         s = CommonSolve.solve(ode, alg; abstol, reltol, tstops = f.tstops)
         SciMLBase.successful_retcode(s) || throw(SolverError("season integration failed with retcode $(s.retcode)"))
         push!(seasons, s)
-        uend = s.u[end]
-        C = p.c_w * (f.gate === nothing ? uend[sporulating(p)] : uend[gated(p)])
+        C = winter_source(p, f, s.u[end])
         push!(winter, C)
     end
     return MildewSolution(prob, [s for s in seasons], winter)
 end
+
+# A stand's state at the start of a season with primary inoculum C (u0 must be zeroed).
+function season_start!(u0, p::MildewParameters, f, C)
+    u0[1] = f.leaves0
+    if f.pulse
+        # release everything at t0: each leaf present escapes with probability exp(-b_a C)
+        infected = -expm1(-p.b_a * C * f.weather(f.tspan[1]))
+        u0[1] = f.leaves0 * (1 - infected)
+        u0[p.L == 0 ? sporulating(p) : first(latent_stages(p))] = f.leaves0 * infected
+    else
+        u0[inoculum(p)] = C
+    end
+    return u0
+end
+
+# The winter map: next season's primary inoculum from a stand's state at the end of this one.
+winter_source(p::MildewParameters, f, uend) = p.c_w * (f.gate === nothing ? uend[sporulating(p)] : uend[gated(p)])
 
 """
     leaf_area(sol::MildewSolution, season, t)
@@ -322,10 +334,25 @@ end
 The leaves present on day `t` of `season` (young, mature, latent, sporulating and spent), as a
 fraction of the stand's maximum.
 """
-function leaf_area(sol::MildewSolution, season::Integer, t::Real)
-    p = sol.prob.p
-    u = sol(season, t)
-    return sum(@view u[1:spent(p)])
+leaf_area(sol::MildewSolution, season::Integer, t::Real) = stand_leaves(sol.prob.p, sol(season, t))
+
+# per-stand summaries of a state vector u
+stand_leaves(p::MildewParameters, u) = sum(@view u[1:spent(p)])
+stand_infected(p::MildewParameters, u) = sum(@view u[(p.K + 2):spent(p)])
+function stand_visible(p::MildewParameters, u, latent_visible)
+    return u[sporulating(p)] + u[spent(p)] + latent_visible * sum(@view u[latent_stages(p)])
+end
+function stand_incidence(p::MildewParameters, u)
+    A = stand_leaves(p, u)
+    return A > 0 ? stand_infected(p, u) / A : 0.0
+end
+function stand_visible_incidence(p::MildewParameters, u, latent_visible)
+    A = stand_leaves(p, u)
+    return A > 0 ? stand_visible(p, u, latent_visible) / A : 0.0
+end
+function check_latent_visible(latent_visible)
+    0 ≤ latent_visible ≤ 1 || throw(ArgumentError("latent_visible must be in [0, 1], got $latent_visible"))
+    return nothing
 end
 
 """
@@ -334,12 +361,7 @@ end
 The share of leaves present on day `t` of `season` that are infected (latent, sporulating or
 spent).
 """
-function incidence(sol::MildewSolution, season::Integer, t::Real)
-    p = sol.prob.p
-    u = sol(season, t)
-    A = sum(@view u[1:spent(p)])
-    return A > 0 ? sum(@view u[(p.K + 2):spent(p)]) / A : 0.0
-end
+incidence(sol::MildewSolution, season::Integer, t::Real) = stand_incidence(sol.prob.p, sol(season, t))
 
 """
     visible_incidence(sol::MildewSolution, season, t; latent_visible = 0.0)
@@ -348,13 +370,8 @@ The share of leaves present on day `t` of `season` with visible mildew: sporulat
 leaves, plus a share `latent_visible` of latent ones.
 """
 function visible_incidence(sol::MildewSolution, season::Integer, t::Real; latent_visible::Real = 0.0)
-    0 ≤ latent_visible ≤ 1 || throw(ArgumentError("latent_visible must be in [0, 1], got $latent_visible"))
-    p = sol.prob.p
-    u = sol(season, t)
-    A = sum(@view u[1:spent(p)])
-    A > 0 || return 0.0
-    visible = u[sporulating(p)] + u[spent(p)] + latent_visible * sum(@view u[latent_stages(p)])
-    return visible / A
+    check_latent_visible(latent_visible)
+    return stand_visible_incidence(sol.prob.p, sol(season, t), latent_visible)
 end
 
 """
