@@ -1,7 +1,15 @@
-# Fit the leaf-level model to the six dated mildew scores of the Pierroton seedling experiment
+# Fit the leaf-level model to the mildew scores of the Pierroton seedling experiment
 # (Barrès et al. 2024; dates, treatments and flush timing from Desprez-Loustau et al. 2014).
 #
-#   julia --project=vignettes scripts/fit_pierroton.jl [outdir]
+#   julia --project=vignettes scripts/fit_pierroton.jl [outdir] [variant]
+#
+# variant (default "base") adds options joined by "+", e.g. "winter+dates":
+#   winter  a separate survival factor k for the 2010/11 winter (the 2011 primary inoculum is
+#           k c_w W instead of c_w W), for the early 2011 epidemic;
+#   dates   also fits the six undated 2009-2011 scores (two a year), each pair at the ordered
+#           whole days between that year's dated scores that fit best (profiled out; every
+#           treatment scored on the same day; oid3_10 and oid4_11, which have second-shoot
+#           scores, no earlier than that flush). They are plotted as diamonds.
 #
 # Data: data/pierroton/ (plot means, budburst, daily weather; see its README). Each of the nine
 # plots is a replicate of its treatment: L (fungicide), M (natural), H (natural plus spores
@@ -15,12 +23,16 @@ using Optim
 using Plots
 using Printf
 using Statistics
-using Dates: Date, dayofyear
+using Dates: Date, Day, dayofyear
 using LinearAlgebra: Symmetric, inv, diag, eigvals
 
 const DATA = joinpath(@__DIR__, "..", "data", "pierroton")
 const OUT = length(ARGS) ≥ 1 ? ARGS[1] : joinpath(@__DIR__, "..", "runs", "pierroton_fit")
 mkpath(OUT)
+const VARIANT = length(ARGS) ≥ 2 ? ARGS[2] : "base"
+const OPTIONS = Set(split(VARIANT, '+'))
+issubset(OPTIONS, Set(["base", "winter", "dates"])) || error("unknown variant: $VARIANT")
+const WINTER, UNDATED = "winter" in OPTIONS, "dates" in OPTIONS
 
 function readcsv(path)
     lines = readlines(path)
@@ -36,6 +48,17 @@ scores = filter(r -> r["date_known"] == "1" && r["kind"] == "percent", readcsv(j
 obs = [(year = parse(Int, r["year"]), day = dayofyear(Date(r["date"])), treatment = r["treatment"],
         plot = parse(Int, r["plot"]), mean = parse(Float64, r["mean"]) / 100, n = parse(Int, r["n"])) for r in scores]
 @assert length(obs) == 54
+# the undated whole-seedling scores, two a year between the dated first-flush and final scores
+const UNDATED_COLUMNS = Dict(2009 => ("oid2_09", "oid3_09"), 2010 => ("oid3_10", "oid4_10"),
+                             2011 => ("oid3_11", "oid4_11"))
+const WINDOW = Dict(y => extrema(o.day for o in obs if o.year == y) for y in YEARS)
+# scores with a second-shoot companion (oid3P2_10, oid4P2_11) come after that flush was noted
+const EARLIEST = Dict("oid3_10" => doy(2010, 6, 15), "oid4_11" => doy(2011, 5, 24))
+const undated = [(year = parse(Int, r["year"]), column = String(r["column"]), treatment = r["treatment"],
+                  plot = parse(Int, r["plot"]), mean = parse(Float64, r["mean"]) / 100)
+                 for r in readcsv(joinpath(DATA, "plot_scores.csv"))
+                 if r["column"] in Iterators.flatten(values(UNDATED_COLUMNS))]
+@assert length(undated) == 54
 weather_rows = readcsv(joinpath(DATA, "weather.csv"))
 temperature = Dict(y => DailySeries([parse(Float64, r["tmean"]) for r in weather_rows if r["year"] == string(y)])
                    for y in YEARS)
@@ -76,10 +99,12 @@ const DAYS = collect(91.0:1.0:299.0)
 const BUDBURST = Dict(y => FLUSH[y].dates[1] for y in YEARS)
 # Fungicide efficacy is fixed at 1 (full protection just after a spray): fitted, it went to the
 # bound, with or without a free decay (wiki: oak/barres-fit.md). The decay is fitted.
-const NAMES = ["b_c", "b_ext", "c_w", "dose", "tau_s", "release_lag", "fungicide_decay", "obs_sd"]
+const NAMES = ["b_c", "b_ext", "c_w", "dose", "tau_s", "release_lag", "fungicide_decay", "obs_sd",
+               (WINTER ? ["winter_2011"] : String[])...]
 function unpack(θ)
     return (b_c = exp(θ[1]), b_ext = exp(θ[2]), c_w = exp(θ[3]), efficacy = 1.0, dose = exp(θ[4]),
-            tau_s = exp(θ[5]), lag = θ[6], decay = exp(θ[7]), sd = exp(θ[8]))
+            tau_s = exp(θ[5]), lag = θ[6], decay = exp(θ[7]), sd = exp(θ[8]),
+            winter = WINTER ? exp(θ[9]) : 1.0)
 end
 
 function simulate(q, treatment)
@@ -92,8 +117,9 @@ function simulate(q, treatment)
         inoc = treatment == "H" ? [(d, q.dose) for d in INOCULATION[y]] : Tuple{Float64,Float64}[]
         SeasonForcing(; tspan = TSPAN, production = FLUSH[y], release, weather = t -> beta_response(T(t)) * spray(t),
                       development = t -> degree_day_rate(T(t); base = LATENT_BASE, reference = 20.0),
-                      # myclobutanil also suppresses chasmothecium formation on treated leaves
-                      gate = t -> t ≥ 240 ? spray(t) : 0.0, inoculations = inoc,
+                      # myclobutanil also suppresses chasmothecium formation on treated leaves;
+                      # the 2010 gate carries the 2010/11 winter factor (1 unless "winter")
+                      gate = t -> t ≥ 240 ? (y == 2010 ? q.winter : 1.0) * spray(t) : 0.0, inoculations = inoc,
                       tstops = [DAYS; treatment == "L" ? FUNGICIDE[y] : Float64[]])
     end
     return solve(MildewProblem(p, collect(forcings), 0.0); abstol = 1e-9, reltol = 1e-7)
@@ -103,32 +129,67 @@ logit(x) = log(x / (1 - x))
 # the score is the percentage of leaf area infected, i.e. the visible share of leaf area
 severity(sol, season, day) = visible_incidence(sol, season, day)
 
-function predictions(q)
+lg(x) = logit(clamp(x, 1e-4, 1 - 1e-4))
+
+# Model predictions and logit residuals. With "dates", each year's pair of undated scores is put
+# at the ordered pair of whole days strictly between the dated scores that minimises their
+# squared residuals: the profile over the dates, since nothing else in the objective depends on
+# them.
+function fitted(q)
     sols = Dict(t => simulate(q, t) for t in ("L", "M", "H"))
-    return [severity(sols[o.treatment], o.year - 2008, Float64(o.day)) for o in obs], sols
+    pred = [severity(sols[o.treatment], o.year - 2008, Float64(o.day)) for o in obs]
+    r = [lg(o.mean) - lg(m) for (o, m) in zip(obs, pred)]
+    dates = Dict{String,Int}()
+    if UNDATED
+        for y in YEARS
+            days = (WINDOW[y][1] + 1):(WINDOW[y][2] - 1)
+            curve = Dict(t => [lg(severity(sols[t], y - 2008, Float64(d))) for d in days] for t in ("L", "M", "H"))
+            c1, c2 = UNDATED_COLUMNS[y]
+            ssr(c) = [sum(abs2(lg(o.mean) - curve[o.treatment][i]) for o in undated if o.column == c)
+                      for i in eachindex(days)]
+            s1, s2 = ssr(c1), ssr(c2)
+            for (s, c) in ((s1, c1), (s2, c2)), i in eachindex(days)
+                days[i] < get(EARLIEST, c, 0) && (s[i] = Inf)
+            end
+            best, i1, i2, low, at = Inf, 0, 0, Inf, 0
+            for j in 2:length(days)        # best i1 < i2: running minimum of s1 before j
+                s1[j - 1] < low && ((low, at) = (s1[j - 1], j - 1))
+                low + s2[j] < best && ((best, i1, i2) = (low + s2[j], at, j))
+            end
+            dates[c1], dates[c2] = days[i1], days[i2]
+            for o in undated
+                o.year == y && push!(r, lg(o.mean) - curve[o.treatment][o.column == c1 ? i1 : i2])
+            end
+        end
+    end
+    return (; pred, r, dates, sols)
 end
 
 # weak priors keep the optimiser in a sensible region; release near budburst (Marçais et al. 2009)
-# the fungicide's residual activity: median 10 days, log-sd 0.7 (95 % within about 2.5 to 40 days)
+# the fungicide's residual activity: median 10 days, log-sd 0.7 (95 % within about 2.5 to 40 days);
+# the 2010/11 winter factor: median 1, log-sd 2
 logprior(θ, q) = -0.5 * (q.lag / 15)^2 - 0.5 * ((θ[7] - log(10.0)) / 0.7)^2 -
-                 0.5 * sum(abs2, (θ[1:5] .- log.([0.2, 0.005, 1.0, 1.0, 20.0])) ./ 3)
+                 0.5 * sum(abs2, (θ[1:5] .- log.([0.2, 0.005, 1.0, 1.0, 20.0])) ./ 3) -
+                 (WINTER ? 0.5 * (θ[9] / 2)^2 : 0.0)
 
 function negloglik(θ)
     q = unpack(θ)
-    pred = try
-        first(predictions(q))
+    r = try
+        fitted(q).r
     catch err
         err isa PowderyMildewError || rethrow()
         return Inf
     end
-    r = [logit(clamp(o.mean, 1e-4, 1 - 1e-4)) - logit(clamp(m, 1e-4, 1 - 1e-4)) for (o, m) in zip(obs, pred)]
     return length(r) * log(q.sd) + sum(abs2, r) / (2q.sd^2) - logprior(θ, q)
 end
 
 println("budburst (score 2) days: ", join((@sprintf("%d %.1f", y, BUDBURST[y]) for y in YEARS), ", "))
-# start from the fit with efficacy and decay both free (runs/pierroton_fit5; efficacy 1 - 3e-7)
-θ0 = [-0.05054, -6.19660, -1.75241, -1.29904, 2.23563, -12.19812, 2.42790, 0.07621]
-@printf("start: %.3f\n", negloglik(θ0))
+# start from the base fit (runs/pierroton_fit6, objective 31.8754); "winter" starts at k = 3
+θ0 = [-0.050825674964122325, -6.195781043528346, -1.7499149460273897, -1.2983793059662951,
+      2.2350727981292726, -12.223854149725843, 2.4289737677520136, 0.0750593311357487,
+      (WINTER ? [log(3.0)] : Float64[])...]
+@printf("variant %s: start %.3f\n", VARIANT, negloglik(θ0))
+flush(stdout)
 # Nelder-Mead from three starts, each restarted from its own optimum until it stops improving
 function minimise(start)
     res = optimize(negloglik, start, NelderMead(), Optim.Options(; iterations = 3000, f_reltol = 1e-10))
@@ -144,6 +205,7 @@ best = nothing
 for (k, start) in enumerate((θ0,))
     r = minimise(start)
     @printf("start %d: objective %.4f (converged: %s)\n", k, Optim.minimum(r), Optim.converged(r))
+    flush(stdout)
     global best = best === nothing || Optim.minimum(r) < Optim.minimum(best) ? r : best
 end
 res = best
@@ -164,13 +226,15 @@ H = hessian(negloglik, θ̂)
 Σ = inv(Symmetric(H))
 se = sqrt.(max.(diag(Σ), 0))
 
-pred, sols = predictions(q̂)
+fit = fitted(q̂)
+pred, sols = fit.pred, fit.sols
 open(joinpath(OUT, "fit.txt"), "w") do io
     for out in (stdout, io)
+        @printf(out, "variant %s: %d plot means\n", VARIANT, length(fit.r))
         @printf(out, "objective %.4f; Hessian eigenvalues %.3g to %.3g\n", Optim.minimum(res), extrema(eigvals(Symmetric(H)))...)
         println(out, "optimum on the unconstrained scale: ", θ̂)
         println(out, "parameter          estimate   (95% interval from the Laplace approximation)")
-        tr = [exp, exp, exp, exp, exp, identity, exp, exp]
+        tr = [exp, exp, exp, exp, exp, identity, exp, exp, exp]
         for (k, name) in enumerate(NAMES)
             @printf(out, "%-18s %9.4g   (%.4g, %.4g)\n", name, tr[k](θ̂[k]), tr[k](θ̂[k] - 1.96se[k]), tr[k](θ̂[k] + 1.96se[k]))
         end
@@ -179,6 +243,16 @@ open(joinpath(OUT, "fit.txt"), "w") do io
             idx = findall(o -> o.year == y && o.day == d && o.treatment == t, obs)
             @printf(out, "%d %3d  %s   %-30s %6.1f\n", y, d, t, join((@sprintf("%5.1f", 100obs[i].mean) for i in idx), " "),
                     100pred[idx[1]])
+        end
+        if UNDATED
+            println(out, "\nundated scores at their profiled days")
+            for y in YEARS, c in UNDATED_COLUMNS[y], t in ("L", "M", "H")
+                d = fit.dates[c]
+                idx = findall(o -> o.column == c && o.treatment == t, undated)
+                @printf(out, "%d %3d  %s   %-30s %6.1f   %s, %s\n", y, d, t,
+                        join((@sprintf("%5.1f", 100undated[i].mean) for i in idx), " "),
+                        100severity(sols[t], y - 2008, Float64(d)), c, Date(y) + Day(d - 1))
+            end
         end
     end
 end
@@ -192,6 +266,11 @@ panels = map(YEARS) do y
               label = Dict("L" => "fungicide", "M" => "natural", "H" => "added spores")[t])
         o = filter(o -> o.year == y && o.treatment == t, obs)
         scatter!(plt, [x.day for x in o], [100x.mean for x in o]; color = colors[t], ms = 4, label = nothing)
+        if UNDATED
+            u = filter(o -> o.year == y && o.treatment == t, undated)
+            scatter!(plt, [fit.dates[x.column] for x in u], [100x.mean for x in u]; color = colors[t], ms = 4,
+                     markershape = :diamond, label = nothing)
+        end
     end
     plt
 end
