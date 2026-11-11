@@ -23,6 +23,7 @@ export PowderyMildewError, SolverError
 export HamelinParameters, HamelinProblem, HamelinSolution, nspecies, between_season, frequency, incidence,
        coexistence_chi, frequency_loglikelihood
 export MildewParameters, SeasonForcing, MildewProblem, MildewSolution, FlushProduction, ReleaseHazard, DailySeries,
+       FungicideSchedule, degree_day_rate,
        beta_response, leaf_area, visible_incidence, winter_inoculum
 export Landscape, nstands, gridded, Dispersal, dispersal_field, SpatialMildewProblem, SpatialMildewSolution,
        regional_incidence

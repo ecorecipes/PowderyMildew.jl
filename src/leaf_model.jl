@@ -12,8 +12,8 @@
 #   λ = f(t) (b_c I + b_a g(t) C + b_ext)
 #   U₁' = l(t) − (λ + K/τ_s) U₁,   U_k' = (K/τ_s)(U_{k−1} − U_k) − λ U_k,
 #   M'  = (K/τ_s) U_K − ε λ M,
-#   E₁' = λ (ΣU + ε M) − (L/latent) E₁, …,   I' = (L/latent) E_L − γ_I I,   Z' = γ_I I,
-#   C'  = −g(t) C,   W' = η(t) I,
+#   E₁' = λ (ΣU + ε M) − r E₁, …,   I' = r E_L − γ_I I,   Z' = γ_I I,   r = (L/latent) d(t),
+#   C'  = −g(t) C,   W' = η(t) I,   with d(t) the relative rate of latent development (1 by default),
 # and the winter map C_{a+1} = c_w W_a (or c_w I_a(end) with `gate = nothing`). With all
 # leaves present at the start, τ_s = ∞, no latency, a pulse release and the end-of-season
 # gate, it is the one-species model of Hamelin et al. (2016) with β = b_c, α = γ_I and
@@ -30,8 +30,8 @@ Parameters of the leaf-level model:
 - `tau_s`: mean time (days) a young leaf stays fully susceptible, Erlang with `K` stages (`Inf`
   for leaves that never mature);
 - `epsilon`: susceptibility of mature leaves relative to young ones;
-- `latent`: mean latent period (days), Erlang with `L` stages; `L = 0` makes infected leaves
-  sporulate at once;
+- `latent`: mean latent period (days) at unit development rate (see `development` in
+  [`SeasonForcing`](@ref)), Erlang with `L` stages; `L = 0` makes infected leaves sporulate at once;
 - `gamma_I`: rate (per day) at which sporulation stops;
 - `c_w`: next year's primary inoculum per unit of gated sporulating leaf-days.
 """
@@ -156,8 +156,47 @@ function beta_response(T; Tmin = 5.0, Topt = 21.5, Tmax = 30.0)
 end
 
 """
+    degree_day_rate(T; base, reference)
+
+A linear thermal-time development rate, `max(T - base, 0) / (reference - base)`: 0 at or below
+`base` and 1 at `reference` (°C). Used as `development` in [`SeasonForcing`](@ref), it makes the
+latent period last `latent` days at `reference` and a fixed number of degree-days above `base`.
+"""
+function degree_day_rate(T; base, reference)
+    base < reference || throw(ArgumentError("need base < reference, got $base and $reference"))
+    return max(T - base, 0.0) / (reference - base)
+end
+
+"""
+    FungicideSchedule(dates; efficacy, decay)
+
+Protection by a fungicide applied on `dates` (days): a multiplier of the force of infection,
+`1 - efficacy * exp(-(t - t_last) / decay)` with `t_last` the latest application on or before
+`t`, and 1 before the first. `efficacy` (between 0 and 1) is the reduction just after an
+application and `decay` (days) the e-folding time of its residual activity. Compose it with the
+weather, e.g. `weather = t -> beta_response(T(t)) * schedule(t)`, and put the dates in `tstops`.
+"""
+struct FungicideSchedule
+    dates::Vector{Float64}
+    efficacy::Float64
+    decay::Float64
+    function FungicideSchedule(dates::AbstractVector{<:Real}; efficacy::Real, decay::Real)
+        0 ≤ efficacy ≤ 1 || throw(ArgumentError("efficacy must be in [0, 1], got $efficacy"))
+        isfinite(decay) && decay > 0 || throw(ArgumentError("decay must be finite and positive, got $decay"))
+        return new(sort!(collect(Float64, dates)), Float64(efficacy), Float64(decay))
+    end
+end
+
+function (s::FungicideSchedule)(t)
+    k = searchsortedlast(s.dates, t)
+    k == 0 && return 1.0
+    return 1 - s.efficacy * exp(-(t - s.dates[k]) / s.decay)
+end
+
+"""
     SeasonForcing(; tspan, leaves0 = 0.0, production = t -> 0.0, release = t -> 0.0, pulse = false,
-                  weather = t -> 1.0, gate = nothing, tstops = Float64[])
+                  weather = t -> 1.0, development = t -> 1.0, gate = nothing, inoculations = [],
+                  tstops = Float64[])
 
 The forcing of one season, over `tspan = (t0, t1)` in days (day of year, say):
 - `leaves0`: young susceptible leaves present at `t0`;
@@ -167,28 +206,67 @@ The forcing of one season, over `tspan = (t0, t1)` in days (day of year, say):
   leaves present (the fast-release limit);
 - `weather`: the multiplier `f(t)` of the force of infection, e.g. [`beta_response`](@ref) of a
   daily temperature series;
+- `development`: `d(t) ≥ 0`, the rate of latent development relative to the one at which the mean
+  latent period is `latent`, e.g. [`degree_day_rate`](@ref) of a daily temperature series; the
+  latent stages then advance at `(L/latent) d(t)`, so the latent period is shorter in warm weather;
 - `gate`: `η(t)`, the weight of sporulating leaves in next year's inoculum; `nothing` uses the
   sporulating leaves at the end of the season, as Hamelin et al. (2016) do;
+- `inoculations`: added inoculum, as `(day, dose)` pairs with `t0 < day < t1`. At each, a share
+  `1 - exp(-dose f(day))` of the young susceptible leaves (`1 - exp(-ε dose f(day))` of the mature
+  ones) is infected at once, as when spores are blown onto seedlings;
 - `tstops`: times the solver must step to, such as day boundaries of daily forcings.
 """
-struct SeasonForcing{P,R,F,G}
+struct SeasonForcing{P,R,F,D,G}
     tspan::Tuple{Float64,Float64}
     leaves0::Float64
     production::P
     release::R
     pulse::Bool
     weather::F
+    development::D
     gate::G
+    inoculations::Vector{Tuple{Float64,Float64}}
     tstops::Vector{Float64}
 end
 
 function SeasonForcing(; tspan, leaves0 = 0.0, production = t -> 0.0, release = t -> 0.0, pulse::Bool = false,
-                       weather = t -> 1.0, gate = nothing, tstops = Float64[])
+                       weather = t -> 1.0, development = t -> 1.0, gate = nothing,
+                       inoculations = Tuple{Float64,Float64}[], tstops = Float64[])
     t0, t1 = Float64.(tspan)
     t0 < t1 || throw(ArgumentError("tspan must be increasing, got $tspan"))
     leaves0 ≥ 0 || throw(ArgumentError("leaves0 must be nonnegative, got $leaves0"))
-    return SeasonForcing((t0, t1), Float64(leaves0), production, release, pulse, weather, gate,
-                         collect(Float64, tstops))
+    inoc = sort!([(Float64(d), Float64(x)) for (d, x) in inoculations])
+    for (d, x) in inoc
+        t0 < d < t1 || throw(ArgumentError("inoculation day $d must lie strictly inside tspan $tspan"))
+        isfinite(x) && x ≥ 0 || throw(ArgumentError("inoculation dose must be finite and nonnegative, got $x"))
+    end
+    return SeasonForcing((t0, t1), Float64(leaves0), production, release, pulse, weather, development, gate, inoc,
+                         sort!(unique!([collect(Float64, tstops); first.(inoc)])))
+end
+
+# Apply the inoculations of forcing f that fall on day t to one stand's state u.
+function inoculate!(u, p::MildewParameters, f, t)
+    for (d, dose) in f.inoculations
+        d == t || continue
+        x = dose * f.weather(t)
+        target = p.L == 0 ? sporulating(p) : first(latent_stages(p))
+        for k in young(p)
+            infected = -expm1(-x) * u[k]
+            u[k] -= infected
+            u[target] += infected
+        end
+        infected = -expm1(-p.epsilon * x) * u[mature(p)]
+        u[mature(p)] -= infected
+        u[target] += infected
+    end
+    return u
+end
+
+function inoculation_callback(p::MildewParameters, f)
+    days = first.(f.inoculations)
+    condition(u, t, integrator) = t in days
+    affect!(integrator) = inoculate!(integrator.u, p, f, integrator.t)
+    return SciMLBase.DiscreteCallback(condition, affect!)
 end
 
 # state layout
@@ -230,7 +308,7 @@ function leaf_rhs!(du, u, p::MildewParameters, f, t, conidia)
     if L == 0
         du[iI] = new_infections - p.gamma_I * u[iI]
     else
-        rate = L / p.latent
+        rate = L / p.latent * f.development(t)
         first = K + 2
         @inbounds du[first] = new_infections - rate * u[first]
         @inbounds for j in (first + 1):(K + 1 + L)
@@ -302,7 +380,11 @@ function CommonSolve.solve(prob::MildewProblem; alg = Tsit5(), abstol = 1e-12, r
         u0 = zeros(nstate(p))
         season_start!(u0, p, f, C)
         ode = ODEProblem(LeafRHS(p, f), u0, f.tspan)
-        s = CommonSolve.solve(ode, alg; abstol, reltol, tstops = f.tstops)
+        s = if isempty(f.inoculations)
+            CommonSolve.solve(ode, alg; abstol, reltol, tstops = f.tstops)
+        else
+            CommonSolve.solve(ode, alg; abstol, reltol, tstops = f.tstops, callback = inoculation_callback(p, f))
+        end
         SciMLBase.successful_retcode(s) || throw(SolverError("season integration failed with retcode $(s.retcode)"))
         push!(seasons, s)
         C = winter_source(p, f, s.u[end])

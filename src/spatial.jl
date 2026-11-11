@@ -139,6 +139,8 @@ struct SpatialMildewProblem{F}
         size(forcings, 2) ≥ 1 || throw(ArgumentError("need at least one season"))
         length(C0) == n || throw(ArgumentError("C0 needs one value per stand ($n), got $(length(C0))"))
         all(c -> isfinite(c) && c ≥ 0, C0) || throw(ArgumentError("C0 must be finite and nonnegative"))
+        any(f -> !isempty(f.inoculations), forcings) &&
+            throw(ArgumentError("inoculations are not supported by the spatial model yet"))
         for s in axes(forcings, 2)
             spans = unique(f.tspan for f in forcings[:, s])
             length(spans) == 1 || throw(ArgumentError("season $s: all stands must share one tspan, got $spans"))

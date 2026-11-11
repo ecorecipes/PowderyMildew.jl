@@ -13,6 +13,8 @@ FlushProduction
 ReleaseHazard
 DailySeries
 beta_response
+FungicideSchedule
+degree_day_rate
 ```
 
 ## Problem and solution
