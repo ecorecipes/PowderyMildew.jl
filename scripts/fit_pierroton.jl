@@ -9,7 +9,9 @@
 #   dates   also fits the six undated 2009-2011 scores (two a year), each pair at the ordered
 #           whole days between that year's dated scores that fit best (profiled out; every
 #           treatment scored on the same day; oid3_10 and oid4_11, which have second-shoot
-#           scores, no earlier than that flush). They are plotted as diamonds.
+#           scores, no earlier than that flush). They are plotted as diamonds;
+#   shed    diseased leaves (sporulating or spent) fall at a fitted rate (`shed` in
+#           MildewParameters), so the visibly diseased share can fall.
 #
 # Data: data/pierroton/ (plot means, budburst, daily weather; see its README). Each of the nine
 # plots is a replicate of its treatment: L (fungicide), M (natural), H (natural plus spores
@@ -31,8 +33,9 @@ const OUT = length(ARGS) ≥ 1 ? ARGS[1] : joinpath(@__DIR__, "..", "runs", "pie
 mkpath(OUT)
 const VARIANT = length(ARGS) ≥ 2 ? ARGS[2] : "base"
 const OPTIONS = Set(split(VARIANT, '+'))
-issubset(OPTIONS, Set(["base", "winter", "dates"])) || error("unknown variant: $VARIANT")
-const WINTER, UNDATED = "winter" in OPTIONS, "dates" in OPTIONS
+issubset(OPTIONS, Set(["base", "winter", "dates", "shed"])) || error("unknown variant: $VARIANT")
+const WINTER, UNDATED, SHED = "winter" in OPTIONS, "dates" in OPTIONS, "shed" in OPTIONS
+const ISHED = 9 + WINTER       # position of log(shed) in θ
 
 function readcsv(path)
     lines = readlines(path)
@@ -100,16 +103,16 @@ const BUDBURST = Dict(y => FLUSH[y].dates[1] for y in YEARS)
 # Fungicide efficacy is fixed at 1 (full protection just after a spray): fitted, it went to the
 # bound, with or without a free decay (wiki: oak/barres-fit.md). The decay is fitted.
 const NAMES = ["b_c", "b_ext", "c_w", "dose", "tau_s", "release_lag", "fungicide_decay", "obs_sd",
-               (WINTER ? ["winter_2011"] : String[])...]
+               (WINTER ? ["winter_2011"] : String[])..., (SHED ? ["shed"] : String[])...]
 function unpack(θ)
     return (b_c = exp(θ[1]), b_ext = exp(θ[2]), c_w = exp(θ[3]), efficacy = 1.0, dose = exp(θ[4]),
             tau_s = exp(θ[5]), lag = θ[6], decay = exp(θ[7]), sd = exp(θ[8]),
-            winter = WINTER ? exp(θ[9]) : 1.0)
+            winter = WINTER ? exp(θ[9]) : 1.0, shed = SHED ? exp(θ[ISHED]) : 0.0)
 end
 
 function simulate(q, treatment)
     p = MildewParameters(; b_c = q.b_c, b_a = 1.0, b_ext = q.b_ext, tau_s = q.tau_s, K = 3, epsilon = 0.05,
-                         latent = 7.0, L = 3, gamma_I = 0.05, c_w = q.c_w)
+                         latent = 7.0, L = 3, gamma_I = 0.05, c_w = q.c_w, shed = q.shed)
     forcings = map(YEARS) do y
         T = temperature[y]
         release = ReleaseHazard(; rate = 0.2, optimum = BUDBURST[y] + q.lag, curvature = -0.003)
@@ -167,10 +170,11 @@ end
 
 # weak priors keep the optimiser in a sensible region; release near budburst (Marçais et al. 2009)
 # the fungicide's residual activity: median 10 days, log-sd 0.7 (95 % within about 2.5 to 40 days);
-# the 2010/11 winter factor: median 1, log-sd 2
+# the 2010/11 winter factor: median 1, log-sd 2; shedding: median 0.002 per day (a diseased
+# leaf's mean life before premature fall 500 days, so most survive the season), log-sd 2
 logprior(θ, q) = -0.5 * (q.lag / 15)^2 - 0.5 * ((θ[7] - log(10.0)) / 0.7)^2 -
                  0.5 * sum(abs2, (θ[1:5] .- log.([0.2, 0.005, 1.0, 1.0, 20.0])) ./ 3) -
-                 (WINTER ? 0.5 * (θ[9] / 2)^2 : 0.0)
+                 (WINTER ? 0.5 * (θ[9] / 2)^2 : 0.0) - (SHED ? 0.5 * ((θ[ISHED] - log(0.002)) / 2)^2 : 0.0)
 
 function negloglik(θ)
     q = unpack(θ)
@@ -184,10 +188,21 @@ function negloglik(θ)
 end
 
 println("budburst (score 2) days: ", join((@sprintf("%d %.1f", y, BUDBURST[y]) for y in YEARS), ", "))
-# start from the base fit (runs/pierroton_fit6, objective 31.8754); "winter" starts at k = 3
-θ0 = [-0.050825674964122325, -6.195781043528346, -1.7499149460273897, -1.2983793059662951,
-      2.2350727981292726, -12.223854149725843, 2.4289737677520136, 0.0750593311357487,
-      (WINTER ? [log(3.0)] : Float64[])...]
+# start from the base fit (runs/pierroton_fit6, objective 31.8754), or with "dates" from the
+# fit-8 optimum of the same variant (runs/pierroton_fit8_*); "winter" starts at k = 3 and
+# "shed" at 0.001 per day
+θ0 = if UNDATED && WINTER
+    [-0.3198769484862051, -6.262513650703709, -2.7638127948248825, -1.6610414898299364, 2.6194371379575245,
+     -7.344399879501469, 2.6475266204658663, -0.11983558463385383, 1.9212111431795236]
+elseif UNDATED
+    [-0.05027322394419971, -6.241311132277026, -1.6766906990844392, -1.467156260990763, 2.245497117133406,
+     -14.028218466298291, 2.235622150388756, -0.08804940452979772]
+else
+    [-0.050825674964122325, -6.195781043528346, -1.7499149460273897, -1.2983793059662951,
+     2.2350727981292726, -12.223854149725843, 2.4289737677520136, 0.0750593311357487,
+     (WINTER ? [log(3.0)] : Float64[])...]
+end
+SHED && push!(θ0, log(0.001))
 @printf("variant %s: start %.3f\n", VARIANT, negloglik(θ0))
 flush(stdout)
 # Nelder-Mead from three starts, each restarted from its own optimum until it stops improving
@@ -234,7 +249,7 @@ open(joinpath(OUT, "fit.txt"), "w") do io
         @printf(out, "objective %.4f; Hessian eigenvalues %.3g to %.3g\n", Optim.minimum(res), extrema(eigvals(Symmetric(H)))...)
         println(out, "optimum on the unconstrained scale: ", θ̂)
         println(out, "parameter          estimate   (95% interval from the Laplace approximation)")
-        tr = [exp, exp, exp, exp, exp, identity, exp, exp, exp]
+        tr = [exp, exp, exp, exp, exp, identity, exp, exp, exp, exp]
         for (k, name) in enumerate(NAMES)
             @printf(out, "%-18s %9.4g   (%.4g, %.4g)\n", name, tr[k](θ̂[k]), tr[k](θ̂[k] - 1.96se[k]), tr[k](θ̂[k] + 1.96se[k]))
         end

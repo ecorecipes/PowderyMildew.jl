@@ -87,3 +87,37 @@ end
     nsol = solve(MildewProblem(q, g, 0.0))
     @test incidence(ssol, 1, 60.0) ≈ fill(incidence(nsol, 1, 60.0), 2) rtol = 1e-6
 end
+
+@testset "shedding of diseased leaves" begin
+    @test MildewParameters(; b_c = 0.1, b_a = 1.0).shed == 0.0
+    @test_throws ArgumentError MildewParameters(; b_c = 0.1, b_a = 1.0, shed = -0.01)
+    @test_throws ArgumentError MildewParameters(; b_c = 0.1, b_a = 1.0, shed = Inf)
+
+    # one inoculation on day 1 and no further infection: with s = t - 1 and I0 = 1 - e^-1,
+    # I = I0 e^{-(γ+δ)s}, Z = I0 e^{-δs}(1 - e^{-γs}), leaves = 1 - I0 + I0 e^{-δs}
+    γ, δ = 0.1, 0.05
+    p = MildewParameters(; b_c = 0.0, b_a = 0.0, gamma_I = γ, shed = δ)   # [U M I Z C W]
+    f = SeasonForcing(; tspan = (0.0, 40.0), leaves0 = 1.0, inoculations = [(1.0, 1.0)])
+    sol = solve(MildewProblem(p, f, 0.0); abstol = 1e-12, reltol = 1e-10)
+    I0 = 1 - exp(-1)
+    for t in (5.0, 11.0, 30.0)
+        s = t - 1
+        @test sol(1, t)[3] ≈ I0 * exp(-(γ + δ) * s) rtol = 1e-7
+        @test sol(1, t)[4] ≈ I0 * exp(-δ * s) * (1 - exp(-γ * s)) rtol = 1e-7
+        @test leaf_area(sol, 1, t) ≈ 1 - I0 + I0 * exp(-δ * s) rtol = 1e-7
+        @test visible_incidence(sol, 1, t) ≈ I0 * exp(-δ * s) / (1 - I0 + I0 * exp(-δ * s)) rtol = 1e-7
+    end
+    # so the visibly diseased share falls, where without shedding it stays at I0
+    keep = solve(MildewProblem(MildewParameters(; b_c = 0.0, b_a = 0.0, gamma_I = γ), f, 0.0))
+    @test visible_incidence(keep, 1, 30.0) ≈ I0 rtol = 1e-6
+    @test visible_incidence(sol, 1, 30.0) < visible_incidence(sol, 1, 5.0)
+
+    # the spatial model sheds the same way
+    q = MildewParameters(; b_c = 0.3, b_a = 0.0, b_ext = 0.01, tau_s = 20.0, K = 2, epsilon = 0.1, latent = 8.0,
+                         L = 3, gamma_I = 0.05, shed = 0.03)
+    g = SeasonForcing(; tspan = (0.0, 60.0), leaves0 = 1.0)
+    ssol = solve(SpatialMildewProblem(q, Landscape(ones(1, 2); cellsize = 1.0), Dispersal(; rho = 0.0, ell = 1.0), g, 0.0))
+    nsol = solve(MildewProblem(q, g, 0.0))
+    @test incidence(ssol, 1, 60.0) ≈ fill(incidence(nsol, 1, 60.0), 2) rtol = 1e-6
+    @test visible_incidence(ssol, 1, 60.0) ≈ fill(visible_incidence(nsol, 1, 60.0), 2) rtol = 1e-6
+end

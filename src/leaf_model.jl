@@ -12,8 +12,9 @@
 #   λ = f(t) (b_c I + b_a g(t) C + b_ext)
 #   U₁' = l(t) − (λ + K/τ_s) U₁,   U_k' = (K/τ_s)(U_{k−1} − U_k) − λ U_k,
 #   M'  = (K/τ_s) U_K − ε λ M,
-#   E₁' = λ (ΣU + ε M) − r E₁, …,   I' = r E_L − γ_I I,   Z' = γ_I I,   r = (L/latent) d(t),
-#   C'  = −g(t) C,   W' = η(t) I,   with d(t) the relative rate of latent development (1 by default),
+#   E₁' = λ (ΣU + ε M) − r E₁, …,   I' = r E_L − (γ_I + δ) I,   Z' = γ_I I − δ Z,   r = (L/latent) d(t),
+#   C'  = −g(t) C,   W' = η(t) I,   with d(t) the relative rate of latent development (1 by default)
+# and δ the rate at which diseased leaves are shed (0 by default; shed leaves leave the stand),
 # and the winter map C_{a+1} = c_w W_a (or c_w I_a(end) with `gate = nothing`). With all
 # leaves present at the start, τ_s = ∞, no latency, a pulse release and the end-of-season
 # gate, it is the one-species model of Hamelin et al. (2016) with β = b_c, α = γ_I and
@@ -21,7 +22,7 @@
 
 """
     MildewParameters(; b_c, b_a, b_ext = 0.0, tau_s = Inf, K = 1, epsilon = 0.0, latent = 0.0,
-                     L = 0, gamma_I = 0.0, c_w = 1.0)
+                     L = 0, gamma_I = 0.0, c_w = 1.0, shed = 0.0)
 
 Parameters of the leaf-level model:
 - `b_c`: secondary (conidial) transmission per day per unit sporulating leaf fraction;
@@ -33,7 +34,9 @@ Parameters of the leaf-level model:
 - `latent`: mean latent period (days) at unit development rate (see `development` in
   [`SeasonForcing`](@ref)), Erlang with `L` stages; `L = 0` makes infected leaves sporulate at once;
 - `gamma_I`: rate (per day) at which sporulation stops;
-- `c_w`: next year's primary inoculum per unit of gated sporulating leaf-days.
+- `c_w`: next year's primary inoculum per unit of gated sporulating leaf-days;
+- `shed`: rate (per day) at which diseased leaves, sporulating or spent, fall prematurely. Shed
+  leaves leave the stand, so the leaf area and the visibly diseased share can fall.
 """
 struct MildewParameters
     b_c::Float64
@@ -46,8 +49,10 @@ struct MildewParameters
     L::Int
     gamma_I::Float64
     c_w::Float64
-    function MildewParameters(b_c, b_a, b_ext, tau_s, K, epsilon, latent, L, gamma_I, c_w)
-        for (name, v) in (("b_c", b_c), ("b_a", b_a), ("b_ext", b_ext), ("gamma_I", gamma_I), ("c_w", c_w))
+    shed::Float64
+    function MildewParameters(b_c, b_a, b_ext, tau_s, K, epsilon, latent, L, gamma_I, c_w, shed = 0.0)
+        for (name, v) in (("b_c", b_c), ("b_a", b_a), ("b_ext", b_ext), ("gamma_I", gamma_I), ("c_w", c_w),
+                          ("shed", shed))
             isfinite(v) && v ≥ 0 || throw(ArgumentError("$name must be finite and nonnegative, got $v"))
         end
         tau_s > 0 || throw(ArgumentError("tau_s must be positive (Inf for no maturation), got $tau_s"))
@@ -59,14 +64,14 @@ struct MildewParameters
         else
             isfinite(latent) && latent > 0 || throw(ArgumentError("latent must be finite and positive when L > 0, got $latent"))
         end
-        return new(b_c, b_a, b_ext, tau_s, K, epsilon, latent, L, gamma_I, c_w)
+        return new(b_c, b_a, b_ext, tau_s, K, epsilon, latent, L, gamma_I, c_w, shed)
     end
 end
 
 function MildewParameters(; b_c, b_a, b_ext = 0.0, tau_s = Inf, K = 1, epsilon = 0.0, latent = 0.0, L = 0,
-                          gamma_I = 0.0, c_w = 1.0)
+                          gamma_I = 0.0, c_w = 1.0, shed = 0.0)
     return MildewParameters(Float64(b_c), Float64(b_a), Float64(b_ext), Float64(tau_s), Int(K), Float64(epsilon),
-                            Float64(latent), Int(L), Float64(gamma_I), Float64(c_w))
+                            Float64(latent), Int(L), Float64(gamma_I), Float64(c_w), Float64(shed))
 end
 
 """
@@ -306,7 +311,7 @@ function leaf_rhs!(du, u, p::MildewParameters, f, t, conidia)
     susceptible += p.epsilon * u[iM]
     new_infections = λ * susceptible
     if L == 0
-        du[iI] = new_infections - p.gamma_I * u[iI]
+        du[iI] = new_infections - (p.gamma_I + p.shed) * u[iI]
     else
         rate = L / p.latent * f.development(t)
         first = K + 2
@@ -314,9 +319,9 @@ function leaf_rhs!(du, u, p::MildewParameters, f, t, conidia)
         @inbounds for j in (first + 1):(K + 1 + L)
             du[j] = rate * (u[j - 1] - u[j])
         end
-        @inbounds du[iI] = rate * u[K + 1 + L] - p.gamma_I * u[iI]
+        @inbounds du[iI] = rate * u[K + 1 + L] - (p.gamma_I + p.shed) * u[iI]
     end
-    du[spent(p)] = p.gamma_I * u[iI]
+    du[spent(p)] = p.gamma_I * u[iI] - p.shed * u[spent(p)]
     du[iC] = -g * u[iC]
     du[gated(p)] = f.gate === nothing ? 0.0 : f.gate(t) * u[iI]
     return nothing
