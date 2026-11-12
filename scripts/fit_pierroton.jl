@@ -18,7 +18,12 @@
 #           (`shed` times the `shedding` forcing): a daily bucket of CAPACITY mm, filled by
 #           rain and emptied by Hargreaves reference evapotranspiration scaled by the water
 #           left, run from 1 January 2008. Not with "shed"; with "severity" it scales both.
-#   A start for the added rates (log scale) may follow the variant on the command line.
+#   power   with "severity", the rate is shed_severity D^p with p fitted (`shed_power`), so mild
+#           epidemics shed little;
+#   late    two leaf cohorts, the first flush and the later ones (`cohorts`), and only later-flush
+#           leaves are shed (`cohort_shedding = [0, 1]`): mildew does not make first-flush leaves
+#           fall (Desprez-Loustau et al. 2014). Each cohort's shedding uses its own D.
+#   A start for the added parameters (log scale) may follow the variant on the command line.
 #
 # Data: data/pierroton/ (plot means, budburst, daily weather; see its README). Each of the nine
 # plots is a replicate of its treatment: L (fungicide), M (natural), H (natural plus spores
@@ -40,13 +45,18 @@ const OUT = length(ARGS) ≥ 1 ? ARGS[1] : joinpath(@__DIR__, "..", "runs", "pie
 mkpath(OUT)
 const VARIANT = length(ARGS) ≥ 2 ? ARGS[2] : "base"
 const OPTIONS = Set(split(VARIANT, '+'))
-issubset(OPTIONS, Set(["base", "winter", "dates", "shed", "severity", "drought"])) || error("unknown variant: $VARIANT")
+issubset(OPTIONS, Set(["base", "winter", "dates", "shed", "severity", "drought", "power", "late"])) ||
+    error("unknown variant: $VARIANT")
 const WINTER, UNDATED, SHED = "winter" in OPTIONS, "dates" in OPTIONS, "shed" in OPTIONS
 const SEVERITY, DROUGHT = "severity" in OPTIONS, "drought" in OPTIONS
+const POWER, LATE = "power" in OPTIONS, "late" in OPTIONS
 SHED && DROUGHT && error("\"shed\" and \"drought\" both set the shedding rate; use one")
+POWER && !SEVERITY && error("\"power\" needs \"severity\"")
+LATE && !(SHED || SEVERITY || DROUGHT) && error("\"late\" needs a shedding option")
 const ISHED = 9 + WINTER       # positions in θ of log(shed), log(shed_severity), log(drought rate)
 const ISEV = ISHED + SHED
 const IDRY = ISEV + SEVERITY
+const IPOW = IDRY + DROUGHT
 
 function readcsv(path)
     lines = readlines(path)
@@ -114,6 +124,9 @@ end
 const FLUSH = Dict(2009 => FlushProduction([145.0, 190.0], [10.0, 10.0], [0.6, 0.4]),
                    2010 => FlushProduction([score2_day(2010), 160.0, 200.0], [5.0, 8.0, 8.0], [0.5, 0.3, 0.2]),
                    2011 => FlushProduction([score2_day(2011), 140.0, 171.0], [5.0, 6.0, 8.0], [0.5, 0.3, 0.2]))
+# for "late": the first flush (2009, emergence) and the later flushes as two leaf cohorts
+const COHORTS = Dict(y => (FlushProduction(f.dates[1:1], f.spreads[1:1], f.sizes[1:1]),
+                           FlushProduction(f.dates[2:end], f.spreads[2:end], f.sizes[2:end])) for (y, f) in FLUSH)
 # Fungicide (L): first application and the weeks of all applications.
 fungicide_days(first, w0, weeks) = [first + 7.0 * (w - w0) for w in weeks]
 const FUNGICIDE = Dict(2009 => fungicide_days(doy(2009, 6, 22), 25, (25, 28, 30, 32, 35, 37)),
@@ -135,25 +148,27 @@ const BUDBURST = Dict(y => FLUSH[y].dates[1] for y in YEARS)
 # bound, with or without a free decay (wiki: oak/barres-fit.md). The decay is fitted.
 const NAMES = ["b_c", "b_ext", "c_w", "dose", "tau_s", "release_lag", "fungicide_decay", "obs_sd",
                (WINTER ? ["winter_2011"] : String[])..., (SHED ? ["shed"] : String[])...,
-               (SEVERITY ? ["shed_severity"] : String[])..., (DROUGHT ? ["shed_drought"] : String[])...]
+               (SEVERITY ? ["shed_severity"] : String[])..., (DROUGHT ? ["shed_drought"] : String[])...,
+               (POWER ? ["shed_power"] : String[])...]
 function unpack(θ)
     return (b_c = exp(θ[1]), b_ext = exp(θ[2]), c_w = exp(θ[3]), efficacy = 1.0, dose = exp(θ[4]),
             tau_s = exp(θ[5]), lag = θ[6], decay = exp(θ[7]), sd = exp(θ[8]),
             winter = WINTER ? exp(θ[9]) : 1.0,
             shed = SHED ? exp(θ[ISHED]) : DROUGHT ? exp(θ[IDRY]) : 0.0,
-            shed_severity = SEVERITY ? exp(θ[ISEV]) : 0.0)
+            shed_severity = SEVERITY ? exp(θ[ISEV]) : 0.0, shed_power = POWER ? exp(θ[IPOW]) : 1.0)
 end
 
 function simulate(q, treatment)
     p = MildewParameters(; b_c = q.b_c, b_a = 1.0, b_ext = q.b_ext, tau_s = q.tau_s, K = 3, epsilon = 0.05,
                          latent = 7.0, L = 3, gamma_I = 0.05, c_w = q.c_w, shed = q.shed,
-                         shed_severity = q.shed_severity)
+                         shed_severity = q.shed_severity, shed_power = q.shed_power, cohorts = LATE ? 2 : 1,
+                         cohort_shedding = LATE ? [0.0, 1.0] : [1.0])
     forcings = map(YEARS) do y
         T = temperature[y]
         release = ReleaseHazard(; rate = 0.2, optimum = BUDBURST[y] + q.lag, curvature = -0.003)
         spray = treatment == "L" ? FungicideSchedule(FUNGICIDE[y]; efficacy = q.efficacy, decay = q.decay) : t -> 1.0
         inoc = treatment == "H" ? [(d, q.dose) for d in INOCULATION[y]] : Tuple{Float64,Float64}[]
-        SeasonForcing(; tspan = TSPAN, production = FLUSH[y], release, weather = t -> beta_response(T(t)) * spray(t),
+        SeasonForcing(; tspan = TSPAN, production = LATE ? COHORTS[y] : FLUSH[y], release, weather = t -> beta_response(T(t)) * spray(t),
                       development = t -> degree_day_rate(T(t); base = LATENT_BASE, reference = 20.0),
                       shedding = DROUGHT ? DEFICIT[y] : t -> 1.0,
                       # myclobutanil also suppresses chasmothecium formation on treated leaves;
@@ -214,7 +229,7 @@ logprior(θ, q) = -0.5 * (q.lag / 15)^2 - 0.5 * ((θ[7] - log(10.0)) / 0.7)^2 -
                  0.5 * sum(abs2, (θ[1:5] .- log.([0.2, 0.005, 1.0, 1.0, 20.0])) ./ 3) -
                  (WINTER ? 0.5 * (θ[9] / 2)^2 : 0.0) - (SHED ? 0.5 * ((θ[ISHED] - log(0.002)) / 2)^2 : 0.0) -
                  (SEVERITY ? 0.5 * ((θ[ISEV] - log(0.005)) / 2)^2 : 0.0) -
-                 (DROUGHT ? 0.5 * ((θ[IDRY] - log(0.003)) / 2)^2 : 0.0)
+                 (DROUGHT ? 0.5 * ((θ[IDRY] - log(0.003)) / 2)^2 : 0.0) - (POWER ? 0.5 * θ[IPOW]^2 : 0.0)
 
 function negloglik(θ)
     q = unpack(θ)
@@ -243,8 +258,14 @@ else
      (WINTER ? [log(3.0)] : Float64[])...]
 end
 SHED && push!(θ0, log(0.001))
-SEVERITY && push!(θ0, log(0.002))
+if SEVERITY && UNDATED && WINTER && !SHED && !DROUGHT   # the fit-10 optimum (runs/pierroton_fit10_*)
+    θ0 = [0.31759195163279214, -6.591071744648859, -3.04487710692643, -1.072858612183583, 2.588070829008947,
+          -7.725750928580431, 3.1560008605176697, -0.16682358634763997, 1.5342647908926692, -2.9567556372800534]
+else
+    SEVERITY && push!(θ0, log(0.002))
+end
 DROUGHT && push!(θ0, log(0.001))
+POWER && push!(θ0, 0.0)
 # a start for the added rates on the command line: julia ... outdir variant log_rate...
 length(ARGS) > 2 && (θ0[(end - length(ARGS) + 3):end] = parse.(Float64, ARGS[3:end]))
 @printf("variant %s: start %.3f\n", VARIANT, negloglik(θ0))
@@ -314,10 +335,16 @@ open(joinpath(OUT, "fit.txt"), "w") do io
             end
         end
         if SHED || SEVERITY || DROUGHT
-            println(out, "\nleaves present at the final score, as a share of the leaves produced (%)")
+            println(out, "\nleaves present at the final score, as a share of the leaves produced (%)",
+                    LATE ? "; first flush, later flushes" : "")
             for y in YEARS, t in ("L", "M", "H")
                 d = Float64(WINDOW[y][2])
-                @printf(out, "%d %3d  %s   %5.1f\n", y, d, t, 100leaf_area(sols[t], y - 2008, d) / sum(FLUSH[y].sizes))
+                @printf(out, "%d %3d  %s   %5.1f", y, d, t, 100leaf_area(sols[t], y - 2008, d) / sum(FLUSH[y].sizes))
+                if LATE
+                    @printf(out, "   %5.1f  %5.1f", (100leaf_area(sols[t], y - 2008, d; cohort = c) / sum(COHORTS[y][c].sizes)
+                                                  for c in 1:2)...)
+                end
+                println(out)
             end
         end
     end

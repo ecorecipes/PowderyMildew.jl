@@ -167,3 +167,73 @@ end
     @test visible_incidence(ssol, 1, 60.0) ≈ fill(visible_incidence(nsol, 1, 60.0), 2) rtol = 1e-6
     @test leaf_area(ssol, 1, 60.0) ≈ fill(leaf_area(nsol, 1, 60.0), 2) rtol = 1e-6
 end
+
+@testset "shedding with a power of severity" begin
+    @test MildewParameters(; b_c = 0.1, b_a = 1.0).shed_power == 1.0
+    @test_throws ArgumentError MildewParameters(; b_c = 0.1, b_a = 1.0, shed_power = 0.0)
+    @test_throws ArgumentError MildewParameters(; b_c = 0.1, b_a = 1.0, shed_power = Inf)
+    # as above with δ = a (I/(h + I))², I' = -a I³/(h + I)², so
+    # h²/(2I²) + 2h/I - log I = (the same at I0) + a s
+    a = 0.2
+    p = MildewParameters(; b_c = 0.0, b_a = 0.0, shed_severity = a, shed_power = 2.0)
+    f = SeasonForcing(; tspan = (0.0, 40.0), leaves0 = 1.0, inoculations = [(1.0, 1.0)])
+    sol = solve(MildewProblem(p, f, 0.0); abstol = 1e-12, reltol = 1e-10)
+    I0 = 1 - exp(-1)
+    h = 1 - I0
+    F(I) = h^2 / (2I^2) + 2h / I - log(I)
+    for t in (5.0, 20.0, 40.0)
+        @test F(sol(1, t)[3]) ≈ F(I0) + a * (t - 1) rtol = 1e-7
+    end
+    # a power above 1 sheds less at the same rate, since D < 1
+    lin = solve(MildewProblem(MildewParameters(; b_c = 0.0, b_a = 0.0, shed_severity = a), f, 0.0))
+    @test leaf_area(sol, 1, 40.0) > leaf_area(lin, 1, 40.0)
+end
+
+@testset "leaf cohorts" begin
+    common = (; b_c = 0.3, b_a = 1.0, b_ext = 0.01, tau_s = 20.0, K = 2, epsilon = 0.1, latent = 8.0, L = 3,
+              gamma_I = 0.05, c_w = 0.5)
+    first_flush, later = FlushProduction([100.0], [5.0], [0.6]), FlushProduction([140.0, 170.0], [6.0, 8.0], [0.3, 0.1])
+    both = FlushProduction([100.0, 140.0, 170.0], [5.0, 6.0, 8.0], [0.6, 0.3, 0.1])
+    release = ReleaseHazard(; rate = 0.2, optimum = 110.0, curvature = -0.003)
+    season(prod) = SeasonForcing(; tspan = (90.0, 280.0), production = prod, release, gate = t -> t ≥ 240 ? 1.0 : 0.0,
+                                 inoculations = [(120.0, 0.3)], tstops = [120.0])
+    one = solve(MildewProblem(MildewParameters(; common..., shed = 0.01), fill(season(both), 2), 0.05))
+    # with equal shedding weights and a shedding rate that does not depend on D, two cohorts sum
+    # to the one-cohort model
+    two = solve(MildewProblem(MildewParameters(; common..., shed = 0.01, cohorts = 2),
+                              fill(season((first_flush, later)), 2), 0.05))
+    for s in 1:2, t in (115.0, 150.0, 200.0, 280.0)
+        @test leaf_area(two, s, t) ≈ leaf_area(one, s, t) rtol = 1e-6
+        @test visible_incidence(two, s, t) ≈ visible_incidence(one, s, t) rtol = 1e-6
+        @test incidence(two, s, t) ≈ incidence(one, s, t) rtol = 1e-6
+        @test leaf_area(two, s, t; cohort = 1) + leaf_area(two, s, t; cohort = 2) ≈ leaf_area(two, s, t) rtol = 1e-10
+    end
+    @test winter_inoculum(two) ≈ winter_inoculum(one) rtol = 1e-6
+    @test length(two(1, 100.0)) == 2 * (2 + 1 + 3 + 2) + 2
+    # a single production function feeds the first cohort only
+    lone = solve(MildewProblem(MildewParameters(; common..., cohorts = 2), season(both), 0.05))
+    @test leaf_area(lone, 1, 280.0; cohort = 2) == 0.0
+    @test visible_incidence(lone, 1, 200.0) ≈ visible_incidence(
+        solve(MildewProblem(MildewParameters(; common...), season(both), 0.05)), 1, 200.0) rtol = 1e-6
+
+    # shedding of the later cohort only: the first keeps all its leaves
+    q = MildewParameters(; common..., shed_severity = 0.2, cohorts = 2, cohort_shedding = [0.0, 1.0])
+    late = solve(MildewProblem(q, season((first_flush, later)), 0.05))
+    keep = solve(MildewProblem(MildewParameters(; common..., cohorts = 2), season((first_flush, later)), 0.05))
+    @test leaf_area(late, 1, 280.0; cohort = 1) ≈ leaf_area(keep, 1, 280.0; cohort = 1) rtol = 1e-6
+    @test leaf_area(late, 1, 280.0; cohort = 2) < leaf_area(keep, 1, 280.0; cohort = 2) - 1e-3
+    @test 0 < visible_incidence(late, 1, 200.0; cohort = 2) < 1
+
+    # the spatial model has the same cohorts
+    g = SeasonForcing(; tspan = (90.0, 280.0), production = (first_flush, later), release)
+    ssol = solve(SpatialMildewProblem(q, Landscape(ones(1, 2); cellsize = 1.0), Dispersal(; rho = 0.0, ell = 1.0), g, 0.05))
+    nsol = solve(MildewProblem(q, g, 0.05))
+    @test visible_incidence(ssol, 1, 200.0; cohort = 2) ≈ fill(visible_incidence(nsol, 1, 200.0; cohort = 2), 2) rtol = 1e-6
+    @test leaf_area(ssol, 1, 280.0) ≈ fill(leaf_area(nsol, 1, 280.0), 2) rtol = 1e-6
+
+    @test_throws ArgumentError MildewParameters(; common..., cohorts = 0)
+    @test_throws ArgumentError MildewParameters(; common..., cohorts = 2, cohort_shedding = [1.0])
+    @test_throws ArgumentError MildewParameters(; common..., cohorts = 2, cohort_shedding = [1.0, -1.0])
+    @test_throws ArgumentError MildewProblem(MildewParameters(; common...), season((first_flush, later)), 0.0)
+    @test_throws ArgumentError leaf_area(late, 1, 200.0; cohort = 3)
+end

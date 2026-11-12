@@ -14,8 +14,11 @@
 #   M'  = (K/τ_s) U_K − ε λ M,
 #   E₁' = λ (ΣU + ε M) − r E₁, …,   I' = r E_L − (γ_I + δ) I,   Z' = γ_I I − δ Z,   r = (L/latent) d(t),
 #   C'  = −g(t) C,   W' = η(t) I,   with d(t) the relative rate of latent development (1 by default)
-# and δ = s(t) (δ₀ + δ₁ D) the rate at which diseased leaves are shed (0 by default; shed leaves
-# leave the stand), D = (I + Z)/(leaves present) the visibly diseased share and s(t) a forcing,
+# and δ = s(t) w (δ₀ + δ₁ D^q) the rate at which diseased leaves are shed (0 by default; shed
+# leaves leave the stand), D = (I + Z)/(leaves present) the visibly diseased share and s(t) a
+# forcing. With `cohorts` > 1 the leaf block U … Z is repeated once per leaf cohort (flushes,
+# say), each with its own production, shedding weight w and D, all sharing λ; I in λ and W is
+# the sum over cohorts. The state is [block₁ … block_n, C, W];
 # and the winter map C_{a+1} = c_w W_a (or c_w I_a(end) with `gate = nothing`). With all
 # leaves present at the start, τ_s = ∞, no latency, a pulse release and the end-of-season
 # gate, it is the one-species model of Hamelin et al. (2016) with β = b_c, α = γ_I and
@@ -23,7 +26,8 @@
 
 """
     MildewParameters(; b_c, b_a, b_ext = 0.0, tau_s = Inf, K = 1, epsilon = 0.0, latent = 0.0,
-                     L = 0, gamma_I = 0.0, c_w = 1.0, shed = 0.0, shed_severity = 0.0)
+                     L = 0, gamma_I = 0.0, c_w = 1.0, shed = 0.0, shed_severity = 0.0,
+                     shed_power = 1.0, cohorts = 1, cohort_shedding = ones(cohorts))
 
 Parameters of the leaf-level model:
 - `b_c`: secondary (conidial) transmission per day per unit sporulating leaf fraction;
@@ -40,8 +44,16 @@ Parameters of the leaf-level model:
   leaves leave the stand, so the leaf area and the visibly diseased share can fall;
 - `shed_severity`: an increase in that rate per unit of the stand's visibly diseased share `D`
   (sporulating and spent leaves over the leaves present), so the rate is
-  `s(t) (shed + shed_severity D)`, with `s(t)` the `shedding` forcing of [`SeasonForcing`](@ref)
-  (1 by default). Shedding then rises with the severity of the epidemic.
+  `s(t) w (shed + shed_severity D^shed_power)`, with `s(t)` the `shedding` forcing of
+  [`SeasonForcing`](@ref) (1 by default) and `w` the cohort's weight. Shedding then rises with
+  the severity of the epidemic; `shed_power > 1` concentrates it in the most diseased stands;
+- `cohorts`: the number of leaf cohorts, e.g. 2 for the first flush and later ones. Each has its
+  own young, mature, latent, sporulating and spent leaves, its own leaf production (a tuple
+  `production` in [`SeasonForcing`](@ref)) and its own diseased share `D`; all cohorts share
+  the force of infection, and the sporulating leaves of all of them make conidia and next year's
+  inoculum. With one cohort the model is unchanged;
+- `cohort_shedding`: the weight `w` of each cohort in the shedding rate, e.g. `[0, 1]` for
+  shedding of later-flush leaves only.
 """
 struct MildewParameters
     b_c::Float64
@@ -56,12 +68,22 @@ struct MildewParameters
     c_w::Float64
     shed::Float64
     shed_severity::Float64
+    shed_power::Float64
+    cohorts::Int
+    cohort_shedding::Vector{Float64}
     function MildewParameters(b_c, b_a, b_ext, tau_s, K, epsilon, latent, L, gamma_I, c_w, shed = 0.0,
-                              shed_severity = 0.0)
+                              shed_severity = 0.0, shed_power = 1.0, cohorts = 1, cohort_shedding = ones(cohorts))
         for (name, v) in (("b_c", b_c), ("b_a", b_a), ("b_ext", b_ext), ("gamma_I", gamma_I), ("c_w", c_w),
                           ("shed", shed), ("shed_severity", shed_severity))
             isfinite(v) && v ≥ 0 || throw(ArgumentError("$name must be finite and nonnegative, got $v"))
         end
+        isfinite(shed_power) && shed_power > 0 ||
+            throw(ArgumentError("shed_power must be finite and positive, got $shed_power"))
+        cohorts ≥ 1 || throw(ArgumentError("cohorts must be at least 1, got $cohorts"))
+        length(cohort_shedding) == cohorts ||
+            throw(ArgumentError("cohort_shedding needs one weight per cohort ($cohorts), got $(length(cohort_shedding))"))
+        all(w -> isfinite(w) && w ≥ 0, cohort_shedding) ||
+            throw(ArgumentError("cohort_shedding must be finite and nonnegative, got $cohort_shedding"))
         tau_s > 0 || throw(ArgumentError("tau_s must be positive (Inf for no maturation), got $tau_s"))
         K ≥ 1 || throw(ArgumentError("K must be at least 1, got $K"))
         0 ≤ epsilon ≤ 1 || throw(ArgumentError("epsilon must be in [0, 1], got $epsilon"))
@@ -71,15 +93,17 @@ struct MildewParameters
         else
             isfinite(latent) && latent > 0 || throw(ArgumentError("latent must be finite and positive when L > 0, got $latent"))
         end
-        return new(b_c, b_a, b_ext, tau_s, K, epsilon, latent, L, gamma_I, c_w, shed, shed_severity)
+        return new(b_c, b_a, b_ext, tau_s, K, epsilon, latent, L, gamma_I, c_w, shed, shed_severity, shed_power,
+                   cohorts, collect(Float64, cohort_shedding))
     end
 end
 
 function MildewParameters(; b_c, b_a, b_ext = 0.0, tau_s = Inf, K = 1, epsilon = 0.0, latent = 0.0, L = 0,
-                          gamma_I = 0.0, c_w = 1.0, shed = 0.0, shed_severity = 0.0)
+                          gamma_I = 0.0, c_w = 1.0, shed = 0.0, shed_severity = 0.0, shed_power = 1.0, cohorts = 1,
+                          cohort_shedding = ones(cohorts))
     return MildewParameters(Float64(b_c), Float64(b_a), Float64(b_ext), Float64(tau_s), Int(K), Float64(epsilon),
                             Float64(latent), Int(L), Float64(gamma_I), Float64(c_w), Float64(shed),
-                            Float64(shed_severity))
+                            Float64(shed_severity), Float64(shed_power), Int(cohorts), cohort_shedding)
 end
 
 """
@@ -213,7 +237,10 @@ end
 
 The forcing of one season, over `tspan = (t0, t1)` in days (day of year, say):
 - `leaves0`: young susceptible leaves present at `t0`;
-- `production`: leaf production `l(t)`, e.g. a [`FlushProduction`](@ref);
+- `production`: leaf production `l(t)`, e.g. a [`FlushProduction`](@ref). With more than one
+  leaf cohort (`cohorts` in [`MildewParameters`](@ref)) it may be a tuple or vector with one
+  production per cohort; a single function puts all leaves into the first cohort. `leaves0`
+  always starts in the first cohort;
 - `release`: the hazard `g(t)` of primary-inoculum release, e.g. a [`ReleaseHazard`](@ref);
   `pulse = true` instead releases all of it at `t0`, infecting a share `1 - exp(-b_a C)` of the
   leaves present (the fast-release limit);
@@ -261,20 +288,23 @@ function SeasonForcing(; tspan, leaves0 = 0.0, production = t -> 0.0, release = 
                          gate, inoc, sort!(unique!([collect(Float64, tstops); first.(inoc)])))
 end
 
-# Apply the inoculations of forcing f that fall on day t to one stand's state u.
+# Apply the inoculations of forcing f that fall on day t to one stand's state u. Infected leaves
+# stay in their cohort.
 function inoculate!(u, p::MildewParameters, f, t)
     for (d, dose) in f.inoculations
         d == t || continue
         x = dose * f.weather(t)
-        target = p.L == 0 ? sporulating(p) : first(latent_stages(p))
-        for k in young(p)
-            infected = -expm1(-x) * u[k]
-            u[k] -= infected
+        for c in 1:(p.cohorts)
+            target = p.L == 0 ? sporulating(p, c) : first(latent_stages(p, c))
+            for k in young(p, c)
+                infected = -expm1(-x) * u[k]
+                u[k] -= infected
+                u[target] += infected
+            end
+            infected = -expm1(-p.epsilon * x) * u[mature(p, c)]
+            u[mature(p, c)] -= infected
             u[target] += infected
         end
-        infected = -expm1(-p.epsilon * x) * u[mature(p)]
-        u[mature(p)] -= infected
-        u[target] += infected
     end
     return u
 end
@@ -286,69 +316,98 @@ function inoculation_callback(p::MildewParameters, f)
     return SciMLBase.DiscreteCallback(condition, affect!)
 end
 
-# state layout
-nstate(p::MildewParameters) = p.K + 1 + p.L + 4
-young(p) = 1:(p.K)
-mature(p) = p.K + 1
-latent_stages(p) = (p.K + 2):(p.K + 1 + p.L)
-sporulating(p) = p.K + p.L + 2
-spent(p) = p.K + p.L + 3
-inoculum(p) = p.K + p.L + 4
-gated(p) = p.K + p.L + 5
+# state layout: one block [U₁ … U_K, M, E₁ … E_L, I, Z] per cohort, then C and W
+block_size(p::MildewParameters) = p.K + p.L + 3
+offset(p::MildewParameters, c) = (c - 1) * block_size(p)
+nstate(p::MildewParameters) = p.cohorts * block_size(p) + 2
+young(p, c = 1) = offset(p, c) .+ (1:(p.K))
+mature(p, c = 1) = offset(p, c) + p.K + 1
+latent_stages(p, c = 1) = offset(p, c) .+ ((p.K + 2):(p.K + 1 + p.L))
+sporulating(p, c = 1) = offset(p, c) + p.K + p.L + 2
+spent(p, c = 1) = offset(p, c) + p.K + p.L + 3
+inoculum(p) = p.cohorts * block_size(p) + 1
+gated(p) = p.cohorts * block_size(p) + 2
+
+# leaf production into cohort c: a tuple or vector has one production per cohort, a single
+# function feeds the first cohort only
+function cohort_production(f, c, t)
+    P = f.production
+    return P isa Union{Tuple,AbstractVector} ? P[c](t) : (c == 1 ? P(t) : 0.0)
+end
+
+function check_cohorts(p::MildewParameters, f)
+    P = f.production
+    P isa Union{Tuple,AbstractVector} && length(P) != p.cohorts &&
+        throw(ArgumentError("production has $(length(P)) entries but there are $(p.cohorts) cohorts"))
+    return nothing
+end
 
 struct LeafRHS{F}
     p::MildewParameters
     forcing::F
 end
 
-(r::LeafRHS)(du, u, _, t) = leaf_rhs!(du, u, r.p, r.forcing, t, u[sporulating(r.p)])
+(r::LeafRHS)(du, u, _, t) = leaf_rhs!(du, u, r.p, r.forcing, t, stand_sporulating(r.p, u))
 
 # One stand's right-hand side, with `conidia` the conidial pressure that multiplies b_c: the
 # stand's own sporulating leaves in the nonspatial model, a mix of local and dispersed spores in
 # the spatial one.
 function leaf_rhs!(du, u, p::MildewParameters, f, t, conidia)
     K, L = p.K, p.L
-    iI, iC = sporulating(p), inoculum(p)
+    iC = inoculum(p)
     g = f.pulse ? 0.0 : f.release(t)
     λ = f.weather(t) * (p.b_c * conidia + p.b_a * g * u[iC] + p.b_ext)
     age = isinf(p.tau_s) ? 0.0 : K / p.tau_s
-    susceptible = zero(eltype(u))
-    @inbounds for k in 1:K
-        inflow = k == 1 ? f.production(t) : age * u[k - 1]
-        du[k] = inflow - (λ + age) * u[k]
-        susceptible += u[k]
-    end
-    iM = mature(p)
-    @inbounds du[iM] = age * u[K] - p.epsilon * λ * u[iM]
-    susceptible += p.epsilon * u[iM]
-    new_infections = λ * susceptible
-    δ = shedding_rate(p, f, t, u)
-    if L == 0
-        du[iI] = new_infections - (p.gamma_I + δ) * u[iI]
-    else
-        rate = L / p.latent * f.development(t)
-        first = K + 2
-        @inbounds du[first] = new_infections - rate * u[first]
-        @inbounds for j in (first + 1):(K + 1 + L)
-            du[j] = rate * (u[j - 1] - u[j])
+    rate = L == 0 ? 0.0 : L / p.latent * f.development(t)
+    s = p.shed == 0 && p.shed_severity == 0 ? 0.0 : f.shedding(t)
+    total_sporulating = zero(eltype(u))
+    for c in 1:(p.cohorts)
+        o = offset(p, c)
+        susceptible = zero(eltype(u))
+        @inbounds for k in 1:K
+            inflow = k == 1 ? cohort_production(f, c, t) : age * u[o + k - 1]
+            du[o + k] = inflow - (λ + age) * u[o + k]
+            susceptible += u[o + k]
         end
-        @inbounds du[iI] = rate * u[K + 1 + L] - (p.gamma_I + δ) * u[iI]
+        iM, iI, iZ = mature(p, c), sporulating(p, c), spent(p, c)
+        @inbounds du[iM] = age * u[o + K] - p.epsilon * λ * u[iM]
+        susceptible += p.epsilon * u[iM]
+        new_infections = λ * susceptible
+        δ = shedding_rate(p, s, c, u)
+        if L == 0
+            du[iI] = new_infections - (p.gamma_I + δ) * u[iI]
+        else
+            e1 = o + K + 2
+            @inbounds du[e1] = new_infections - rate * u[e1]
+            @inbounds for j in (e1 + 1):(o + K + 1 + L)
+                du[j] = rate * (u[j - 1] - u[j])
+            end
+            @inbounds du[iI] = rate * u[o + K + 1 + L] - (p.gamma_I + δ) * u[iI]
+        end
+        du[iZ] = p.gamma_I * u[iI] - δ * u[iZ]
+        total_sporulating += u[iI]
     end
-    du[spent(p)] = p.gamma_I * u[iI] - δ * u[spent(p)]
     du[iC] = -g * u[iC]
-    du[gated(p)] = f.gate === nothing ? 0.0 : f.gate(t) * u[iI]
+    du[gated(p)] = f.gate === nothing ? 0.0 : f.gate(t) * total_sporulating
     return nothing
 end
 
-# δ = s(t) (shed + shed_severity D), D the visibly diseased share of the leaves present
-function shedding_rate(p::MildewParameters, f, t, u)
-    p.shed == 0 && p.shed_severity == 0 && return 0.0
+# δ = s(t) w_c (shed + shed_severity D_c^q) for cohort c, with s = s(t) (0 when shedding is off)
+# and D_c the visibly diseased share of the cohort's leaves present
+function shedding_rate(p::MildewParameters, s, c, u)
+    s == 0 && return 0.0
+    w = p.cohort_shedding[c]
+    w == 0 && return 0.0
     δ = p.shed
     if p.shed_severity > 0
-        A = stand_leaves(p, u)
-        A > 0 && (δ += p.shed_severity * (u[sporulating(p)] + u[spent(p)]) / A)
+        A = stand_leaves(p, u, c)
+        if A > 0
+            D = (u[sporulating(p, c)] + u[spent(p, c)]) / A
+            # D can be a little below 0 from rounding in the solver, which a real power rejects
+            δ += p.shed_severity * (p.shed_power == 1 ? D : max(D, 0.0)^p.shed_power)
+        end
     end
-    return f.shedding(t) * δ
+    return s * w * δ
 end
 
 """
@@ -366,6 +425,7 @@ struct MildewProblem{F}
         isempty(forcings) && throw(ArgumentError("need at least one season"))
         C0 ≥ 0 || throw(ArgumentError("C0 must be nonnegative, got $C0"))
         v = collect(forcings)
+        foreach(f -> check_cohorts(p, f), v)
         return new{eltype(v)}(p, v, Float64(C0))
     end
 end
@@ -376,7 +436,8 @@ MildewProblem(p::MildewParameters, forcing::SeasonForcing, C0::Real) = MildewPro
     MildewSolution
 
 The solution of a [`MildewProblem`](@ref): one dense ODE solution per season. `sol(season, t)` is
-the state on day `t` of `season`, laid out as `[U₁ … U_K; M; E₁ … E_L; I; Z; C; W]`. See
+the state on day `t` of `season`, laid out as `[U₁ … U_K; M; E₁ … E_L; I; Z; C; W]` (the block
+`U₁ … Z` repeated once per leaf cohort). See
 [`leaf_area`](@ref), [`incidence`](@ref), [`visible_incidence`](@ref) and
 [`winter_inoculum`](@ref).
 """
@@ -437,52 +498,73 @@ function season_start!(u0, p::MildewParameters, f, C)
 end
 
 # The winter map: next season's primary inoculum from a stand's state at the end of this one.
-winter_source(p::MildewParameters, f, uend) = p.c_w * (f.gate === nothing ? uend[sporulating(p)] : uend[gated(p)])
+function winter_source(p::MildewParameters, f, uend)
+    return p.c_w * (f.gate === nothing ? stand_sporulating(p, uend) : uend[gated(p)])
+end
 
 """
-    leaf_area(sol::MildewSolution, season, t)
+    leaf_area(sol::MildewSolution, season, t; cohort = nothing)
 
 The leaves present on day `t` of `season` (young, mature, latent, sporulating and spent), as a
-fraction of the stand's maximum.
+fraction of the stand's maximum; of one leaf cohort only with `cohort` (see `cohorts` in
+[`MildewParameters`](@ref)).
 """
-leaf_area(sol::MildewSolution, season::Integer, t::Real) = stand_leaves(sol.prob.p, sol(season, t))
+function leaf_area(sol::MildewSolution, season::Integer, t::Real; cohort = nothing)
+    check_cohort(sol.prob.p, cohort)
+    return stand_leaves(sol.prob.p, sol(season, t), cohort)
+end
 
-# per-stand summaries of a state vector u
-stand_leaves(p::MildewParameters, u) = sum(@view u[1:spent(p)])
-stand_infected(p::MildewParameters, u) = sum(@view u[(p.K + 2):spent(p)])
-function stand_visible(p::MildewParameters, u, latent_visible)
-    return u[sporulating(p)] + u[spent(p)] + latent_visible * sum(@view u[latent_stages(p)])
+# per-stand summaries of a state vector u, over all cohorts (c = nothing) or one
+cohorts_of(p, c) = c === nothing ? (1:(p.cohorts)) : (c:c)
+stand_leaves(p::MildewParameters, u, c = nothing) = sum(sum(@view u[offset(p, k) .+ (1:block_size(p))]) for k in cohorts_of(p, c))
+function stand_infected(p::MildewParameters, u, c = nothing)
+    return sum(sum(@view u[offset(p, k) .+ ((p.K + 2):block_size(p))]) for k in cohorts_of(p, c))
 end
-function stand_incidence(p::MildewParameters, u)
-    A = stand_leaves(p, u)
-    return A > 0 ? stand_infected(p, u) / A : 0.0
+stand_sporulating(p::MildewParameters, u) = sum(u[sporulating(p, k)] for k in 1:(p.cohorts))
+function stand_visible(p::MildewParameters, u, latent_visible, c = nothing)
+    return sum(u[sporulating(p, k)] + u[spent(p, k)] + latent_visible * sum(@view u[latent_stages(p, k)]; init = 0.0)
+               for k in cohorts_of(p, c))
 end
-function stand_visible_incidence(p::MildewParameters, u, latent_visible)
-    A = stand_leaves(p, u)
-    return A > 0 ? stand_visible(p, u, latent_visible) / A : 0.0
+function stand_incidence(p::MildewParameters, u, c = nothing)
+    A = stand_leaves(p, u, c)
+    return A > 0 ? stand_infected(p, u, c) / A : 0.0
+end
+function stand_visible_incidence(p::MildewParameters, u, latent_visible, c = nothing)
+    A = stand_leaves(p, u, c)
+    return A > 0 ? stand_visible(p, u, latent_visible, c) / A : 0.0
 end
 function check_latent_visible(latent_visible)
     0 ≤ latent_visible ≤ 1 || throw(ArgumentError("latent_visible must be in [0, 1], got $latent_visible"))
     return nothing
 end
+function check_cohort(p::MildewParameters, cohort)
+    cohort === nothing || 1 ≤ cohort ≤ p.cohorts ||
+        throw(ArgumentError("cohort must be in 1:$(p.cohorts) or nothing, got $cohort"))
+    return nothing
+end
 
 """
-    incidence(sol::MildewSolution, season, t)
+    incidence(sol::MildewSolution, season, t; cohort = nothing)
 
 The share of leaves present on day `t` of `season` that are infected (latent, sporulating or
-spent).
+spent); of one leaf cohort only with `cohort`.
 """
-incidence(sol::MildewSolution, season::Integer, t::Real) = stand_incidence(sol.prob.p, sol(season, t))
+function incidence(sol::MildewSolution, season::Integer, t::Real; cohort = nothing)
+    check_cohort(sol.prob.p, cohort)
+    return stand_incidence(sol.prob.p, sol(season, t), cohort)
+end
 
 """
-    visible_incidence(sol::MildewSolution, season, t; latent_visible = 0.0)
+    visible_incidence(sol::MildewSolution, season, t; latent_visible = 0.0, cohort = nothing)
 
 The share of leaves present on day `t` of `season` with visible mildew: sporulating and spent
-leaves, plus a share `latent_visible` of latent ones.
+leaves, plus a share `latent_visible` of latent ones; of one leaf cohort only with `cohort`.
 """
-function visible_incidence(sol::MildewSolution, season::Integer, t::Real; latent_visible::Real = 0.0)
+function visible_incidence(sol::MildewSolution, season::Integer, t::Real; latent_visible::Real = 0.0,
+                           cohort = nothing)
     check_latent_visible(latent_visible)
-    return stand_visible_incidence(sol.prob.p, sol(season, t), latent_visible)
+    check_cohort(sol.prob.p, cohort)
+    return stand_visible_incidence(sol.prob.p, sol(season, t), latent_visible, cohort)
 end
 
 """

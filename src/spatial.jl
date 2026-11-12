@@ -146,6 +146,7 @@ struct SpatialMildewProblem{F}
             length(spans) == 1 || throw(ArgumentError("season $s: all stands must share one tspan, got $spans"))
         end
         f = collect(forcings)
+        foreach(x -> check_cohorts(p, x), f)
         return new{eltype(f)}(p, land, dispersal, f, collect(Float64, C0))
     end
 end
@@ -171,20 +172,20 @@ end
 
 function (r::SpatialRHS)(du, u, _, t)
     p, land, rho = r.p, r.land, r.rho
-    ns, iI = nstate(p), sporulating(p)
+    ns = nstate(p)
     U = reshape(u, ns, :)
     dU = reshape(du, ns, :)
     if rho > 0
         fill!(r.source, 0.0)
         for (j, k) in enumerate(land.active)
-            r.source[k] = land.host[k] * U[iI, j]
+            r.source[k] = land.host[k] * stand_sporulating(p, view(U, :, j))
         end
         φ = r.factor \ r.source
     else
         φ = r.source
     end
     for (j, k) in enumerate(land.active)
-        conidia = (1 - rho) * U[iI, j] + (rho > 0 ? rho * φ[k] : 0.0)
+        conidia = (1 - rho) * stand_sporulating(p, view(U, :, j)) + (rho > 0 ? rho * φ[k] : 0.0)
         leaf_rhs!(view(dU, :, j), view(U, :, j), p, r.forcings[j], t, conidia)
     end
     return nothing
@@ -250,20 +251,24 @@ function CommonSolve.solve(prob::SpatialMildewProblem; alg = Tsit5(), abstol = 1
     return SpatialMildewSolution(prob, [s for s in seasons], winter)
 end
 
-function leaf_area(sol::SpatialMildewSolution, season::Integer, t::Real)
+function leaf_area(sol::SpatialMildewSolution, season::Integer, t::Real; cohort = nothing)
     p, U = sol.prob.p, sol(season, t)
-    return [stand_leaves(p, view(U, :, j)) for j in axes(U, 2)]
+    check_cohort(p, cohort)
+    return [stand_leaves(p, view(U, :, j), cohort) for j in axes(U, 2)]
 end
 
-function incidence(sol::SpatialMildewSolution, season::Integer, t::Real)
+function incidence(sol::SpatialMildewSolution, season::Integer, t::Real; cohort = nothing)
     p, U = sol.prob.p, sol(season, t)
-    return [stand_incidence(p, view(U, :, j)) for j in axes(U, 2)]
+    check_cohort(p, cohort)
+    return [stand_incidence(p, view(U, :, j), cohort) for j in axes(U, 2)]
 end
 
-function visible_incidence(sol::SpatialMildewSolution, season::Integer, t::Real; latent_visible::Real = 0.0)
+function visible_incidence(sol::SpatialMildewSolution, season::Integer, t::Real; latent_visible::Real = 0.0,
+                           cohort = nothing)
     check_latent_visible(latent_visible)
     p, U = sol.prob.p, sol(season, t)
-    return [stand_visible_incidence(p, view(U, :, j), latent_visible) for j in axes(U, 2)]
+    check_cohort(p, cohort)
+    return [stand_visible_incidence(p, view(U, :, j), latent_visible, cohort) for j in axes(U, 2)]
 end
 
 """

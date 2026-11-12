@@ -19,7 +19,7 @@ function path_laplacian(n)
 end
 
 with_bc(p, b) = MildewParameters(b, p.b_a, p.b_ext, p.tau_s, p.K, p.epsilon, p.latent, p.L, p.gamma_I, p.c_w, p.shed,
-                                     p.shed_severity)
+                                     p.shed_severity, p.shed_power, p.cohorts, p.cohort_shedding)
 
 @testset "spatial model" begin
     p = MildewParameters(; b_c = 0.15, b_a = 3.0, tau_s = 25.0, K = 2, epsilon = 0.1, latent = 8.0, L = 2,
