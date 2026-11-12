@@ -30,6 +30,12 @@
 #           shoot, matches all nine plots to 0.5 points), not a leaf-area share, so it is replaced
 #           by the shoot scores; oid4_11 in 2011 is not such a mean and stays. Not with a shedding
 #           option unless "late".
+#   sizes   the later flushes' share of the leaves fitted for 2010 and 2011 (logit scale, prior
+#           median 0.5, log-odds sd 1.5), split 3:2 between the second and third flush; the
+#           default shares are 0.5 (sizes 0.5, 0.3, 0.2), which were assumed, not measured;
+#   mean2010  with two cohorts, every 2010 score is the seedlings' mean of their shoot scores,
+#           V1 + f (V2 - V1)/2, with V the cohorts' visible shares and f the share of the later
+#           flushes' leaves out (for the share of seedlings with a second shoot), as oid3_10 is.
 #   A start for the added parameters (log scale) may follow the variant on the command line.
 #
 # Data: data/pierroton/ (plot means, budburst, daily weather; see its README). Each of the nine
@@ -52,7 +58,7 @@ const OUT = length(ARGS) ≥ 1 ? ARGS[1] : joinpath(@__DIR__, "..", "runs", "pie
 mkpath(OUT)
 const VARIANT = length(ARGS) ≥ 2 ? ARGS[2] : "base"
 const OPTIONS = Set(split(VARIANT, '+'))
-issubset(OPTIONS, Set(["base", "winter", "dates", "shed", "severity", "drought", "power", "late", "shoots"])) ||
+issubset(OPTIONS, Set(["base", "winter", "dates", "shed", "severity", "drought", "power", "late", "shoots", "sizes", "mean2010"])) ||
     error("unknown variant: $VARIANT")
 const WINTER, UNDATED, SHED = "winter" in OPTIONS, "dates" in OPTIONS, "shed" in OPTIONS
 const SEVERITY, DROUGHT = "severity" in OPTIONS, "drought" in OPTIONS
@@ -65,10 +71,14 @@ SHOOTS && !UNDATED && error("\"shoots\" needs \"dates\"")
 # two cohorts with both shed would compute D per cohort, a different model from one cohort
 SHOOTS && (SHED || SEVERITY || DROUGHT) && !LATE && error("\"shoots\" with shedding needs \"late\"")
 const TWO = LATE || SHOOTS     # two leaf cohorts: the first flush and the later ones
+const SIZES, MEAN2010 = "sizes" in OPTIONS, "mean2010" in OPTIONS
+MEAN2010 && !TWO && error("\"mean2010\" needs two cohorts (\"shoots\" or \"late\")")
 const ISHED = 9 + WINTER       # positions in θ of log(shed), log(shed_severity), log(drought rate)
 const ISEV = ISHED + SHED
 const IDRY = ISEV + SEVERITY
 const IPOW = IDRY + DROUGHT
+const ISIZE = IPOW + POWER     # logit of the later flushes' share, 2010 then 2011
+logistic(x) = 1 / (1 + exp(-x))
 
 function readcsv(path)
     lines = readlines(path)
@@ -144,9 +154,17 @@ end
 const FLUSH = Dict(2009 => FlushProduction([145.0, 190.0], [10.0, 10.0], [0.6, 0.4]),
                    2010 => FlushProduction([score2_day(2010), 160.0, 200.0], [5.0, 8.0, 8.0], [0.5, 0.3, 0.2]),
                    2011 => FlushProduction([score2_day(2011), 140.0, 171.0], [5.0, 6.0, 8.0], [0.5, 0.3, 0.2]))
-# for "late": the first flush (2009, emergence) and the later flushes as two leaf cohorts
-const COHORTS = Dict(y => (FlushProduction(f.dates[1:1], f.spreads[1:1], f.sizes[1:1]),
-                           FlushProduction(f.dates[2:end], f.spreads[2:end], f.sizes[2:end])) for (y, f) in FLUSH)
+# for two cohorts: the first flush (2009, emergence) and the later flushes
+cohorts_of(f) = (FlushProduction(f.dates[1:1], f.spreads[1:1], f.sizes[1:1]),
+                 FlushProduction(f.dates[2:end], f.spreads[2:end], f.sizes[2:end]))
+const COHORTS = Dict(y => cohorts_of(f) for (y, f) in FLUSH)
+# the year's flushes, with "sizes" the fitted share s of the later flushes (sizes 1 - s, 0.6s, 0.4s)
+function flushes(q, y)
+    f = FLUSH[y]
+    haskey(q.later, y) || return f
+    s = q.later[y]
+    return FlushProduction(f.dates, f.spreads, [1 - s, 0.6s, 0.4s])
+end
 # Fungicide (L): first application and the weeks of all applications.
 fungicide_days(first, w0, weeks) = [first + 7.0 * (w - w0) for w in weeks]
 const FUNGICIDE = Dict(2009 => fungicide_days(doy(2009, 6, 22), 25, (25, 28, 30, 32, 35, 37)),
@@ -169,13 +187,14 @@ const BUDBURST = Dict(y => FLUSH[y].dates[1] for y in YEARS)
 const NAMES = ["b_c", "b_ext", "c_w", "dose", "tau_s", "release_lag", "fungicide_decay", "obs_sd",
                (WINTER ? ["winter_2011"] : String[])..., (SHED ? ["shed"] : String[])...,
                (SEVERITY ? ["shed_severity"] : String[])..., (DROUGHT ? ["shed_drought"] : String[])...,
-               (POWER ? ["shed_power"] : String[])...]
+               (POWER ? ["shed_power"] : String[])..., (SIZES ? ["later_2010", "later_2011"] : String[])...]
 function unpack(θ)
     return (b_c = exp(θ[1]), b_ext = exp(θ[2]), c_w = exp(θ[3]), efficacy = 1.0, dose = exp(θ[4]),
             tau_s = exp(θ[5]), lag = θ[6], decay = exp(θ[7]), sd = exp(θ[8]),
             winter = WINTER ? exp(θ[9]) : 1.0,
             shed = SHED ? exp(θ[ISHED]) : DROUGHT ? exp(θ[IDRY]) : 0.0,
-            shed_severity = SEVERITY ? exp(θ[ISEV]) : 0.0, shed_power = POWER ? exp(θ[IPOW]) : 1.0)
+            shed_severity = SEVERITY ? exp(θ[ISEV]) : 0.0, shed_power = POWER ? exp(θ[IPOW]) : 1.0,
+            later = SIZES ? Dict(2010 => logistic(θ[ISIZE]), 2011 => logistic(θ[ISIZE + 1])) : Dict{Int,Float64}())
 end
 
 function simulate(q, treatment)
@@ -188,7 +207,7 @@ function simulate(q, treatment)
         release = ReleaseHazard(; rate = 0.2, optimum = BUDBURST[y] + q.lag, curvature = -0.003)
         spray = treatment == "L" ? FungicideSchedule(FUNGICIDE[y]; efficacy = q.efficacy, decay = q.decay) : t -> 1.0
         inoc = treatment == "H" ? [(d, q.dose) for d in INOCULATION[y]] : Tuple{Float64,Float64}[]
-        SeasonForcing(; tspan = TSPAN, production = TWO ? COHORTS[y] : FLUSH[y], release, weather = t -> beta_response(T(t)) * spray(t),
+        SeasonForcing(; tspan = TSPAN, production = TWO ? cohorts_of(flushes(q, y)) : flushes(q, y), release, weather = t -> beta_response(T(t)) * spray(t),
                       development = t -> degree_day_rate(T(t); base = LATENT_BASE, reference = 20.0),
                       shedding = DROUGHT ? DEFICIT[y] : t -> 1.0,
                       # myclobutanil also suppresses chasmothecium formation on treated leaves;
@@ -201,7 +220,14 @@ end
 
 logit(x) = log(x / (1 - x))
 # the score is the percentage of leaf area infected, i.e. the visible share of leaf area
-severity(sol, season, day) = visible_incidence(sol, season, day)
+# (with "mean2010", in 2010 the seedlings' mean of their shoot scores; f, the share of the later
+# flushes' leaves out, uses the leaves present, so it assumes no shedding)
+function severity(sol, season, day, q)
+    (MEAN2010 && season == 2) || return visible_incidence(sol, season, day)
+    f = min(leaf_area(sol, season, day; cohort = 2) / sum(flushes(q, 2010).sizes[2:end]), 1.0)
+    v1, v2 = (visible_incidence(sol, season, day; cohort = k) for k in 1:2)
+    return v1 + f * (v2 - v1) / 2
+end
 
 lg(x) = logit(clamp(x, 1e-4, 1 - 1e-4))
 
@@ -211,13 +237,13 @@ lg(x) = logit(clamp(x, 1e-4, 1 - 1e-4))
 # them.
 function fitted(q)
     sols = Dict(t => simulate(q, t) for t in ("L", "M", "H"))
-    pred = [severity(sols[o.treatment], o.year - 2008, Float64(o.day)) for o in obs]
+    pred = [severity(sols[o.treatment], o.year - 2008, Float64(o.day), q) for o in obs]
     r = [lg(o.mean) - lg(m) for (o, m) in zip(obs, pred)]
     dates = Dict{String,Int}()
     if UNDATED
         for y in YEARS
             days = (WINDOW[y][1] + 1):(WINDOW[y][2] - 1)
-            curve = Dict(t => [lg(severity(sols[t], y - 2008, Float64(d))) for d in days] for t in ("L", "M", "H"))
+            curve = Dict(t => [lg(severity(sols[t], y - 2008, Float64(d), q)) for d in days] for t in ("L", "M", "H"))
             c1, c2 = UNDATED_COLUMNS[y]
             # with "shoots", each cohort's visible share; the shoot scores join their companion's day
             ys = [o for o in shoot if o.year == y]
@@ -258,7 +284,8 @@ logprior(θ, q) = -0.5 * (q.lag / 15)^2 - 0.5 * ((θ[7] - log(10.0)) / 0.7)^2 -
                  0.5 * sum(abs2, (θ[1:5] .- log.([0.2, 0.005, 1.0, 1.0, 20.0])) ./ 3) -
                  (WINTER ? 0.5 * (θ[9] / 2)^2 : 0.0) - (SHED ? 0.5 * ((θ[ISHED] - log(0.002)) / 2)^2 : 0.0) -
                  (SEVERITY ? 0.5 * ((θ[ISEV] - log(0.005)) / 2)^2 : 0.0) -
-                 (DROUGHT ? 0.5 * ((θ[IDRY] - log(0.003)) / 2)^2 : 0.0) - (POWER ? 0.5 * θ[IPOW]^2 : 0.0)
+                 (DROUGHT ? 0.5 * ((θ[IDRY] - log(0.003)) / 2)^2 : 0.0) - (POWER ? 0.5 * θ[IPOW]^2 : 0.0) -
+                 (SIZES ? 0.5 * sum(abs2, θ[ISIZE:(ISIZE + 1)] ./ 1.5) : 0.0)
 
 function negloglik(θ)
     q = unpack(θ)
@@ -286,6 +313,10 @@ else
      2.2350727981292726, -12.223854149725843, 2.4289737677520136, 0.0750593311357487,
      (WINTER ? [log(3.0)] : Float64[])...]
 end
+if SHOOTS && UNDATED && WINTER && !(SHED || SEVERITY || DROUGHT)   # the fit-12 optimum (pierroton_fit12_shoots)
+    θ0 = [0.1350585576810398, -6.556696462460295, -3.4911550441787256, -2.136159349058975, 2.1734619326934452,
+          -9.326002792648845, 2.390308990529697, 0.07156404061388498, 1.899343854954856]
+end
 SHED && push!(θ0, log(0.001))
 if SEVERITY && LATE && SHOOTS && UNDATED && WINTER && !SHED && !DROUGHT   # fit-11 late optimum
     θ0 = [0.08873906110075355, -6.359842842405908, -2.997394889880566, -1.2616773924224822, 2.445459271591088,
@@ -298,6 +329,7 @@ else
 end
 DROUGHT && push!(θ0, log(0.001))
 POWER && push!(θ0, 0.0)
+SIZES && push!(θ0, 0.0, 0.0)
 # a start for the added rates on the command line: julia ... outdir variant log_rate...
 length(ARGS) > 2 && (θ0[(end - length(ARGS) + 3):end] = parse.(Float64, ARGS[3:end]))
 @printf("variant %s: start %.3f\n", VARIANT, negloglik(θ0))
@@ -346,7 +378,7 @@ open(joinpath(OUT, "fit.txt"), "w") do io
         @printf(out, "objective %.4f; Hessian eigenvalues %.3g to %.3g\n", Optim.minimum(res), extrema(eigvals(Symmetric(H)))...)
         println(out, "optimum on the unconstrained scale: ", θ̂)
         println(out, "parameter          estimate   (95% interval from the Laplace approximation)")
-        tr = [k == 6 ? identity : exp for k in eachindex(NAMES)]
+        tr = [k == 6 ? identity : startswith(NAMES[k], "later") ? logistic : exp for k in eachindex(NAMES)]
         for (k, name) in enumerate(NAMES)
             @printf(out, "%-18s %9.4g   (%.4g, %.4g)\n", name, tr[k](θ̂[k]), tr[k](θ̂[k] - 1.96se[k]), tr[k](θ̂[k] + 1.96se[k]))
         end
@@ -363,7 +395,7 @@ open(joinpath(OUT, "fit.txt"), "w") do io
                 idx = findall(o -> o.column == c && o.treatment == t, undated)
                 @printf(out, "%d %3d  %s   %-30s %6.1f   %s, %s%s\n", y, d, t,
                         join((@sprintf("%5.1f", 100undated[i].mean) for i in idx), " "),
-                        100severity(sols[t], y - 2008, Float64(d)), c, Date(y) + Day(d - 1),
+                        100severity(sols[t], y - 2008, Float64(d), q̂), c, Date(y) + Day(d - 1),
                         c in REPLACED ? " (not fitted: replaced by its shoot scores)" : "")
             end
         end
@@ -381,7 +413,7 @@ open(joinpath(OUT, "fit.txt"), "w") do io
             for t in ("L", "M", "H")
                 d = Float64(fit.dates["oid3_10"])
                 @printf(out, "2010 %3d  %s   shoot mean %6.1f   leaf-area share %6.1f   oid3_10: %s\n", d, t,
-                        50sum(visible_incidence(sols[t], 2, d; cohort = k) for k in 1:2), 100severity(sols[t], 2, d),
+                        50sum(visible_incidence(sols[t], 2, d; cohort = k) for k in 1:2), 100visible_incidence(sols[t], 2, d),
                         join((@sprintf("%5.1f", 100o.mean) for o in undated if o.column == "oid3_10" && o.treatment == t), " "))
             end
         end
@@ -390,9 +422,9 @@ open(joinpath(OUT, "fit.txt"), "w") do io
                     LATE ? "; first flush, later flushes" : "")
             for y in YEARS, t in ("L", "M", "H")
                 d = Float64(WINDOW[y][2])
-                @printf(out, "%d %3d  %s   %5.1f", y, d, t, 100leaf_area(sols[t], y - 2008, d) / sum(FLUSH[y].sizes))
+                @printf(out, "%d %3d  %s   %5.1f", y, d, t, 100leaf_area(sols[t], y - 2008, d) / sum(flushes(q̂, y).sizes))
                 if LATE
-                    @printf(out, "   %5.1f  %5.1f", (100leaf_area(sols[t], y - 2008, d; cohort = c) / sum(COHORTS[y][c].sizes)
+                    @printf(out, "   %5.1f  %5.1f", (100leaf_area(sols[t], y - 2008, d; cohort = c) / sum(cohorts_of(flushes(q̂, y))[c].sizes)
                                                   for c in 1:2)...)
                 end
                 println(out)
@@ -406,7 +438,7 @@ panels = map(YEARS) do y
     plt = plot(; title = string(y), xlabel = "day of year", ylabel = y == 2009 ? "leaf area infected (%)" : "",
                legend = y == 2009 ? :topleft : false, ylims = (0, SHOOTS ? 100 : 75))
     for t in ("L", "M", "H")
-        plot!(plt, DAYS, [100severity(sols[t], y - 2008, d) for d in DAYS]; lw = 2, color = colors[t],
+        plot!(plt, DAYS, [100severity(sols[t], y - 2008, d, q̂) for d in DAYS]; lw = 2, color = colors[t],
               label = Dict("L" => "fungicide", "M" => "natural", "H" => "added spores")[t])
         o = filter(o -> o.year == y && o.treatment == t, obs)
         scatter!(plt, [x.day for x in o], [100x.mean for x in o]; color = colors[t], ms = 4, label = nothing)
