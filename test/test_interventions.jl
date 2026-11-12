@@ -121,3 +121,49 @@ end
     @test incidence(ssol, 1, 60.0) ≈ fill(incidence(nsol, 1, 60.0), 2) rtol = 1e-6
     @test visible_incidence(ssol, 1, 60.0) ≈ fill(visible_incidence(nsol, 1, 60.0), 2) rtol = 1e-6
 end
+
+@testset "shedding that rises with severity, and a shedding forcing" begin
+    @test MildewParameters(; b_c = 0.1, b_a = 1.0).shed_severity == 0.0
+    @test_throws ArgumentError MildewParameters(; b_c = 0.1, b_a = 1.0, shed_severity = -0.1)
+    @test_throws ArgumentError MildewParameters(; b_c = 0.1, b_a = 1.0, shed_severity = NaN)
+
+    # one inoculation on day 1, no further infection and no end to sporulation (γ = 0): with
+    # healthy leaves h = 1 - I0 and δ = a I/(h + I), I' = -a I²/(h + I), so
+    # h/I - log I = h/I0 - log I0 + a s with s = t - 1
+    a = 0.2
+    p = MildewParameters(; b_c = 0.0, b_a = 0.0, shed_severity = a)   # [U M I Z C W]
+    f = SeasonForcing(; tspan = (0.0, 40.0), leaves0 = 1.0, inoculations = [(1.0, 1.0)])
+    sol = solve(MildewProblem(p, f, 0.0); abstol = 1e-12, reltol = 1e-10)
+    I0 = 1 - exp(-1)
+    h = 1 - I0
+    for t in (5.0, 20.0, 40.0)
+        It = sol(1, t)[3]
+        @test h / It - log(It) ≈ h / I0 - log(I0) + a * (t - 1) rtol = 1e-7
+        @test leaf_area(sol, 1, t) ≈ h + It rtol = 1e-9
+    end
+
+    # the forcing multiplies both terms: s = 1/2 is the same as halving shed and shed_severity
+    common = (; b_c = 0.3, b_a = 0.0, b_ext = 0.01, tau_s = 20.0, K = 2, epsilon = 0.1, latent = 8.0, L = 3,
+              gamma_I = 0.05)
+    g(s) = SeasonForcing(; tspan = (0.0, 60.0), leaves0 = 1.0, shedding = s)
+    half = solve(MildewProblem(MildewParameters(; common..., shed = 0.02, shed_severity = 0.1), g(t -> 0.5), 0.0))
+    ref = solve(MildewProblem(MildewParameters(; common..., shed = 0.01, shed_severity = 0.05), g(t -> 1.0), 0.0))
+    @test half(1, 60.0) ≈ ref(1, 60.0) rtol = 1e-6
+    # s = 0 switches shedding off; no shedding until day 20, then shedding
+    none = solve(MildewProblem(MildewParameters(; common...), g(t -> 1.0), 0.0))
+    off = solve(MildewProblem(MildewParameters(; common..., shed = 0.02, shed_severity = 0.1), g(t -> 0.0), 0.0))
+    @test off(1, 60.0) ≈ none(1, 60.0) rtol = 1e-6
+    late = solve(MildewProblem(MildewParameters(; common..., shed_severity = 0.5),
+                               SeasonForcing(; tspan = (0.0, 60.0), leaves0 = 1.0, shedding = t -> t < 20 ? 0.0 : 1.0,
+                                             tstops = [20.0]), 0.0))
+    @test late(1, 19.0) ≈ none(1, 19.0) rtol = 1e-6
+    @test leaf_area(late, 1, 60.0) < leaf_area(none, 1, 60.0)
+
+    # the spatial model sheds the same way
+    q = MildewParameters(; common..., shed = 0.01, shed_severity = 0.2)
+    s = SeasonForcing(; tspan = (0.0, 60.0), leaves0 = 1.0, shedding = t -> 0.5 + 0.01t)
+    ssol = solve(SpatialMildewProblem(q, Landscape(ones(1, 2); cellsize = 1.0), Dispersal(; rho = 0.0, ell = 1.0), s, 0.0))
+    nsol = solve(MildewProblem(q, s, 0.0))
+    @test visible_incidence(ssol, 1, 60.0) ≈ fill(visible_incidence(nsol, 1, 60.0), 2) rtol = 1e-6
+    @test leaf_area(ssol, 1, 60.0) ≈ fill(leaf_area(nsol, 1, 60.0), 2) rtol = 1e-6
+end

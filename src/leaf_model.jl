@@ -14,7 +14,8 @@
 #   M'  = (K/τ_s) U_K − ε λ M,
 #   E₁' = λ (ΣU + ε M) − r E₁, …,   I' = r E_L − (γ_I + δ) I,   Z' = γ_I I − δ Z,   r = (L/latent) d(t),
 #   C'  = −g(t) C,   W' = η(t) I,   with d(t) the relative rate of latent development (1 by default)
-# and δ the rate at which diseased leaves are shed (0 by default; shed leaves leave the stand),
+# and δ = s(t) (δ₀ + δ₁ D) the rate at which diseased leaves are shed (0 by default; shed leaves
+# leave the stand), D = (I + Z)/(leaves present) the visibly diseased share and s(t) a forcing,
 # and the winter map C_{a+1} = c_w W_a (or c_w I_a(end) with `gate = nothing`). With all
 # leaves present at the start, τ_s = ∞, no latency, a pulse release and the end-of-season
 # gate, it is the one-species model of Hamelin et al. (2016) with β = b_c, α = γ_I and
@@ -22,7 +23,7 @@
 
 """
     MildewParameters(; b_c, b_a, b_ext = 0.0, tau_s = Inf, K = 1, epsilon = 0.0, latent = 0.0,
-                     L = 0, gamma_I = 0.0, c_w = 1.0, shed = 0.0)
+                     L = 0, gamma_I = 0.0, c_w = 1.0, shed = 0.0, shed_severity = 0.0)
 
 Parameters of the leaf-level model:
 - `b_c`: secondary (conidial) transmission per day per unit sporulating leaf fraction;
@@ -36,7 +37,11 @@ Parameters of the leaf-level model:
 - `gamma_I`: rate (per day) at which sporulation stops;
 - `c_w`: next year's primary inoculum per unit of gated sporulating leaf-days;
 - `shed`: rate (per day) at which diseased leaves, sporulating or spent, fall prematurely. Shed
-  leaves leave the stand, so the leaf area and the visibly diseased share can fall.
+  leaves leave the stand, so the leaf area and the visibly diseased share can fall;
+- `shed_severity`: an increase in that rate per unit of the stand's visibly diseased share `D`
+  (sporulating and spent leaves over the leaves present), so the rate is
+  `s(t) (shed + shed_severity D)`, with `s(t)` the `shedding` forcing of [`SeasonForcing`](@ref)
+  (1 by default). Shedding then rises with the severity of the epidemic.
 """
 struct MildewParameters
     b_c::Float64
@@ -50,9 +55,11 @@ struct MildewParameters
     gamma_I::Float64
     c_w::Float64
     shed::Float64
-    function MildewParameters(b_c, b_a, b_ext, tau_s, K, epsilon, latent, L, gamma_I, c_w, shed = 0.0)
+    shed_severity::Float64
+    function MildewParameters(b_c, b_a, b_ext, tau_s, K, epsilon, latent, L, gamma_I, c_w, shed = 0.0,
+                              shed_severity = 0.0)
         for (name, v) in (("b_c", b_c), ("b_a", b_a), ("b_ext", b_ext), ("gamma_I", gamma_I), ("c_w", c_w),
-                          ("shed", shed))
+                          ("shed", shed), ("shed_severity", shed_severity))
             isfinite(v) && v ≥ 0 || throw(ArgumentError("$name must be finite and nonnegative, got $v"))
         end
         tau_s > 0 || throw(ArgumentError("tau_s must be positive (Inf for no maturation), got $tau_s"))
@@ -64,14 +71,15 @@ struct MildewParameters
         else
             isfinite(latent) && latent > 0 || throw(ArgumentError("latent must be finite and positive when L > 0, got $latent"))
         end
-        return new(b_c, b_a, b_ext, tau_s, K, epsilon, latent, L, gamma_I, c_w, shed)
+        return new(b_c, b_a, b_ext, tau_s, K, epsilon, latent, L, gamma_I, c_w, shed, shed_severity)
     end
 end
 
 function MildewParameters(; b_c, b_a, b_ext = 0.0, tau_s = Inf, K = 1, epsilon = 0.0, latent = 0.0, L = 0,
-                          gamma_I = 0.0, c_w = 1.0, shed = 0.0)
+                          gamma_I = 0.0, c_w = 1.0, shed = 0.0, shed_severity = 0.0)
     return MildewParameters(Float64(b_c), Float64(b_a), Float64(b_ext), Float64(tau_s), Int(K), Float64(epsilon),
-                            Float64(latent), Int(L), Float64(gamma_I), Float64(c_w), Float64(shed))
+                            Float64(latent), Int(L), Float64(gamma_I), Float64(c_w), Float64(shed),
+                            Float64(shed_severity))
 end
 
 """
@@ -200,8 +208,8 @@ end
 
 """
     SeasonForcing(; tspan, leaves0 = 0.0, production = t -> 0.0, release = t -> 0.0, pulse = false,
-                  weather = t -> 1.0, development = t -> 1.0, gate = nothing, inoculations = [],
-                  tstops = Float64[])
+                  weather = t -> 1.0, development = t -> 1.0, shedding = t -> 1.0, gate = nothing,
+                  inoculations = [], tstops = Float64[])
 
 The forcing of one season, over `tspan = (t0, t1)` in days (day of year, say):
 - `leaves0`: young susceptible leaves present at `t0`;
@@ -214,6 +222,9 @@ The forcing of one season, over `tspan = (t0, t1)` in days (day of year, say):
 - `development`: `d(t) ≥ 0`, the rate of latent development relative to the one at which the mean
   latent period is `latent`, e.g. [`degree_day_rate`](@ref) of a daily temperature series; the
   latent stages then advance at `(L/latent) d(t)`, so the latent period is shorter in warm weather;
+- `shedding`: `s(t) ≥ 0`, a multiplier of the rate at which diseased leaves are shed (`shed` and
+  `shed_severity` in [`MildewParameters`](@ref)), e.g. a soil-water deficit for leaf loss under
+  drought;
 - `gate`: `η(t)`, the weight of sporulating leaves in next year's inoculum; `nothing` uses the
   sporulating leaves at the end of the season, as Hamelin et al. (2016) do;
 - `inoculations`: added inoculum, as `(day, dose)` pairs with `t0 < day < t1`. At each, a share
@@ -221,7 +232,7 @@ The forcing of one season, over `tspan = (t0, t1)` in days (day of year, say):
   ones) is infected at once, as when spores are blown onto seedlings;
 - `tstops`: times the solver must step to, such as day boundaries of daily forcings.
 """
-struct SeasonForcing{P,R,F,D,G}
+struct SeasonForcing{P,R,F,D,S,G}
     tspan::Tuple{Float64,Float64}
     leaves0::Float64
     production::P
@@ -229,13 +240,14 @@ struct SeasonForcing{P,R,F,D,G}
     pulse::Bool
     weather::F
     development::D
+    shedding::S
     gate::G
     inoculations::Vector{Tuple{Float64,Float64}}
     tstops::Vector{Float64}
 end
 
 function SeasonForcing(; tspan, leaves0 = 0.0, production = t -> 0.0, release = t -> 0.0, pulse::Bool = false,
-                       weather = t -> 1.0, development = t -> 1.0, gate = nothing,
+                       weather = t -> 1.0, development = t -> 1.0, shedding = t -> 1.0, gate = nothing,
                        inoculations = Tuple{Float64,Float64}[], tstops = Float64[])
     t0, t1 = Float64.(tspan)
     t0 < t1 || throw(ArgumentError("tspan must be increasing, got $tspan"))
@@ -245,8 +257,8 @@ function SeasonForcing(; tspan, leaves0 = 0.0, production = t -> 0.0, release = 
         t0 < d < t1 || throw(ArgumentError("inoculation day $d must lie strictly inside tspan $tspan"))
         isfinite(x) && x ≥ 0 || throw(ArgumentError("inoculation dose must be finite and nonnegative, got $x"))
     end
-    return SeasonForcing((t0, t1), Float64(leaves0), production, release, pulse, weather, development, gate, inoc,
-                         sort!(unique!([collect(Float64, tstops); first.(inoc)])))
+    return SeasonForcing((t0, t1), Float64(leaves0), production, release, pulse, weather, development, shedding,
+                         gate, inoc, sort!(unique!([collect(Float64, tstops); first.(inoc)])))
 end
 
 # Apply the inoculations of forcing f that fall on day t to one stand's state u.
@@ -310,8 +322,9 @@ function leaf_rhs!(du, u, p::MildewParameters, f, t, conidia)
     @inbounds du[iM] = age * u[K] - p.epsilon * λ * u[iM]
     susceptible += p.epsilon * u[iM]
     new_infections = λ * susceptible
+    δ = shedding_rate(p, f, t, u)
     if L == 0
-        du[iI] = new_infections - (p.gamma_I + p.shed) * u[iI]
+        du[iI] = new_infections - (p.gamma_I + δ) * u[iI]
     else
         rate = L / p.latent * f.development(t)
         first = K + 2
@@ -319,12 +332,23 @@ function leaf_rhs!(du, u, p::MildewParameters, f, t, conidia)
         @inbounds for j in (first + 1):(K + 1 + L)
             du[j] = rate * (u[j - 1] - u[j])
         end
-        @inbounds du[iI] = rate * u[K + 1 + L] - (p.gamma_I + p.shed) * u[iI]
+        @inbounds du[iI] = rate * u[K + 1 + L] - (p.gamma_I + δ) * u[iI]
     end
-    du[spent(p)] = p.gamma_I * u[iI] - p.shed * u[spent(p)]
+    du[spent(p)] = p.gamma_I * u[iI] - δ * u[spent(p)]
     du[iC] = -g * u[iC]
     du[gated(p)] = f.gate === nothing ? 0.0 : f.gate(t) * u[iI]
     return nothing
+end
+
+# δ = s(t) (shed + shed_severity D), D the visibly diseased share of the leaves present
+function shedding_rate(p::MildewParameters, f, t, u)
+    p.shed == 0 && p.shed_severity == 0 && return 0.0
+    δ = p.shed
+    if p.shed_severity > 0
+        A = stand_leaves(p, u)
+        A > 0 && (δ += p.shed_severity * (u[sporulating(p)] + u[spent(p)]) / A)
+    end
+    return f.shedding(t) * δ
 end
 
 """
