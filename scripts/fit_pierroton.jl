@@ -36,7 +36,10 @@
 #   mean2010  with two cohorts, every 2010 score is the seedlings' mean of their shoot scores,
 #           V1 + f (V2 - V1)/2, with V the cohorts' visible shares and f the share of the later
 #           flushes' leaves out (for the share of seedlings with a second shoot), as oid3_10 is.
-#   A start for the added parameters (log scale) may follow the variant on the command line.
+#   epsilon the susceptibility of mature leaves relative to young ones fitted (logit scale, prior
+#           median 0.05, the value fixed otherwise, log-odds sd 1.5);
+#   A start for the added parameters (log scale) may follow the variant on the command line; the
+#   values replace the last entries of the start vector, so a full vector replaces all of it.
 #
 # Data: data/pierroton/ (plot means, budburst, daily weather; see its README). Each of the nine
 # plots is a replicate of its treatment: L (fungicide), M (natural), H (natural plus spores
@@ -58,7 +61,7 @@ const OUT = length(ARGS) ≥ 1 ? ARGS[1] : joinpath(@__DIR__, "..", "runs", "pie
 mkpath(OUT)
 const VARIANT = length(ARGS) ≥ 2 ? ARGS[2] : "base"
 const OPTIONS = Set(split(VARIANT, '+'))
-issubset(OPTIONS, Set(["base", "winter", "dates", "shed", "severity", "drought", "power", "late", "shoots", "sizes", "mean2010"])) ||
+issubset(OPTIONS, Set(["base", "winter", "dates", "shed", "severity", "drought", "power", "late", "shoots", "sizes", "mean2010", "epsilon"])) ||
     error("unknown variant: $VARIANT")
 const WINTER, UNDATED, SHED = "winter" in OPTIONS, "dates" in OPTIONS, "shed" in OPTIONS
 const SEVERITY, DROUGHT = "severity" in OPTIONS, "drought" in OPTIONS
@@ -78,6 +81,8 @@ const ISEV = ISHED + SHED
 const IDRY = ISEV + SEVERITY
 const IPOW = IDRY + DROUGHT
 const ISIZE = IPOW + POWER     # logit of the later flushes' share, 2010 then 2011
+const EPSILON = "epsilon" in OPTIONS
+const IEPS = ISIZE + 2SIZES     # logit of the mature leaves' relative susceptibility
 logistic(x) = 1 / (1 + exp(-x))
 
 function readcsv(path)
@@ -187,18 +192,20 @@ const BUDBURST = Dict(y => FLUSH[y].dates[1] for y in YEARS)
 const NAMES = ["b_c", "b_ext", "c_w", "dose", "tau_s", "release_lag", "fungicide_decay", "obs_sd",
                (WINTER ? ["winter_2011"] : String[])..., (SHED ? ["shed"] : String[])...,
                (SEVERITY ? ["shed_severity"] : String[])..., (DROUGHT ? ["shed_drought"] : String[])...,
-               (POWER ? ["shed_power"] : String[])..., (SIZES ? ["later_2010", "later_2011"] : String[])...]
+               (POWER ? ["shed_power"] : String[])..., (SIZES ? ["later_2010", "later_2011"] : String[])...,
+               (EPSILON ? ["epsilon"] : String[])...]
 function unpack(θ)
     return (b_c = exp(θ[1]), b_ext = exp(θ[2]), c_w = exp(θ[3]), efficacy = 1.0, dose = exp(θ[4]),
             tau_s = exp(θ[5]), lag = θ[6], decay = exp(θ[7]), sd = exp(θ[8]),
             winter = WINTER ? exp(θ[9]) : 1.0,
             shed = SHED ? exp(θ[ISHED]) : DROUGHT ? exp(θ[IDRY]) : 0.0,
             shed_severity = SEVERITY ? exp(θ[ISEV]) : 0.0, shed_power = POWER ? exp(θ[IPOW]) : 1.0,
-            later = SIZES ? Dict(2010 => logistic(θ[ISIZE]), 2011 => logistic(θ[ISIZE + 1])) : Dict{Int,Float64}())
+            later = SIZES ? Dict(2010 => logistic(θ[ISIZE]), 2011 => logistic(θ[ISIZE + 1])) : Dict{Int,Float64}(),
+            epsilon = EPSILON ? logistic(θ[IEPS]) : 0.05)
 end
 
 function simulate(q, treatment)
-    p = MildewParameters(; b_c = q.b_c, b_a = 1.0, b_ext = q.b_ext, tau_s = q.tau_s, K = 3, epsilon = 0.05,
+    p = MildewParameters(; b_c = q.b_c, b_a = 1.0, b_ext = q.b_ext, tau_s = q.tau_s, K = 3, epsilon = q.epsilon,
                          latent = 7.0, L = 3, gamma_I = 0.05, c_w = q.c_w, shed = q.shed,
                          shed_severity = q.shed_severity, shed_power = q.shed_power, cohorts = TWO ? 2 : 1,
                          cohort_shedding = LATE ? [0.0, 1.0] : TWO ? [1.0, 1.0] : [1.0])
@@ -285,7 +292,8 @@ logprior(θ, q) = -0.5 * (q.lag / 15)^2 - 0.5 * ((θ[7] - log(10.0)) / 0.7)^2 -
                  (WINTER ? 0.5 * (θ[9] / 2)^2 : 0.0) - (SHED ? 0.5 * ((θ[ISHED] - log(0.002)) / 2)^2 : 0.0) -
                  (SEVERITY ? 0.5 * ((θ[ISEV] - log(0.005)) / 2)^2 : 0.0) -
                  (DROUGHT ? 0.5 * ((θ[IDRY] - log(0.003)) / 2)^2 : 0.0) - (POWER ? 0.5 * θ[IPOW]^2 : 0.0) -
-                 (SIZES ? 0.5 * sum(abs2, θ[ISIZE:(ISIZE + 1)] ./ 1.5) : 0.0)
+                 (SIZES ? 0.5 * sum(abs2, θ[ISIZE:(ISIZE + 1)] ./ 1.5) : 0.0) -
+                 (EPSILON ? 0.5 * ((θ[IEPS] - logit(0.05)) / 1.5)^2 : 0.0)
 
 function negloglik(θ)
     q = unpack(θ)
@@ -330,6 +338,12 @@ end
 DROUGHT && push!(θ0, log(0.001))
 POWER && push!(θ0, 0.0)
 SIZES && push!(θ0, 0.0, 0.0)
+if SIZES && SHOOTS && UNDATED && WINTER && !(SHED || SEVERITY || DROUGHT || MEAN2010)   # fit-13 sizes optimum
+    θ0[1:11] = [-0.047388940120668376, -6.62623463164331, -3.3375413521401125, -2.504881154748258, 2.4567268288039066,
+                -9.537665012058062, 2.461783358221106, 0.054063520809400925, 2.192505837616085, 1.0057833577270743,
+                1.1583217813912703]
+end
+EPSILON && push!(θ0, logit(0.05))
 # a start for the added rates on the command line: julia ... outdir variant log_rate...
 length(ARGS) > 2 && (θ0[(end - length(ARGS) + 3):end] = parse.(Float64, ARGS[3:end]))
 @printf("variant %s: start %.3f\n", VARIANT, negloglik(θ0))
@@ -378,7 +392,7 @@ open(joinpath(OUT, "fit.txt"), "w") do io
         @printf(out, "objective %.4f; Hessian eigenvalues %.3g to %.3g\n", Optim.minimum(res), extrema(eigvals(Symmetric(H)))...)
         println(out, "optimum on the unconstrained scale: ", θ̂)
         println(out, "parameter          estimate   (95% interval from the Laplace approximation)")
-        tr = [k == 6 ? identity : startswith(NAMES[k], "later") ? logistic : exp for k in eachindex(NAMES)]
+        tr = [k == 6 ? identity : startswith(NAMES[k], "later") || NAMES[k] == "epsilon" ? logistic : exp for k in eachindex(NAMES)]
         for (k, name) in enumerate(NAMES)
             @printf(out, "%-18s %9.4g   (%.4g, %.4g)\n", name, tr[k](θ̂[k]), tr[k](θ̂[k] - 1.96se[k]), tr[k](θ̂[k] + 1.96se[k]))
         end
