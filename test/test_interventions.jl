@@ -237,3 +237,69 @@ end
     @test_throws ArgumentError MildewProblem(MildewParameters(; common...), season((first_flush, later)), 0.0)
     @test_throws ArgumentError leaf_area(late, 1, 200.0; cohort = 3)
 end
+
+@testset "colony spread on diseased leaves" begin
+    common = (; b_c = 0.3, b_a = 1.0, b_ext = 0.01, tau_s = 20.0, K = 2, epsilon = 0.1, latent = 8.0, L = 3,
+              gamma_I = 0.05, c_w = 0.5, shed_severity = 0.1, cohorts = 2, cohort_shedding = [0.0, 1.0])
+    prod = (FlushProduction([100.0], [5.0], [0.6]), FlushProduction([140.0, 170.0], [6.0, 8.0], [0.3, 0.1]))
+    release = ReleaseHazard(; rate = 0.2, optimum = 110.0, curvature = -0.003)
+    g = SeasonForcing(; tspan = (90.0, 280.0), production = prod, release, gate = t -> t ≥ 240 ? 1.0 : 0.0,
+                      inoculations = [(120.0, 0.3)], tstops = [120.0])
+    base = solve(MildewProblem(MildewParameters(; common...), fill(g, 2), 0.05))
+    # the default adds no state and reports the visible share
+    @test length(base(1, 100.0)) == 2 * (2 + 1 + 3 + 2) + 2
+    @test infected_area(base, 2, 200.0) == visible_incidence(base, 2, 200.0)
+    @test infected_area(base, 1, 200.0; cohort = 2) == visible_incidence(base, 1, 200.0; cohort = 2)
+
+    # spread changes the area covered, nothing else
+    spread = solve(MildewProblem(MildewParameters(; common..., cover0 = 0.3, cover_rate = 0.05), fill(g, 2), 0.05))
+    @test length(spread(1, 100.0)) == 2 * (2 + 1 + 3 + 2) + 2 + 2
+    for s in 1:2, t in (130.0, 200.0, 280.0)
+        @test visible_incidence(spread, s, t) ≈ visible_incidence(base, s, t) rtol = 1e-6
+        @test leaf_area(spread, s, t) ≈ leaf_area(base, s, t) rtol = 1e-6
+        @test 0.3 * visible_incidence(spread, s, t) - 1e-9 ≤ infected_area(spread, s, t) ≤ visible_incidence(spread, s, t) + 1e-9
+        @test infected_area(spread, s, t; cohort = 1) ≤ visible_incidence(spread, s, t; cohort = 1) + 1e-9
+    end
+    @test winter_inoculum(spread) ≈ winter_inoculum(base) rtol = 1e-6
+    # cover grows with the age of the infections: the covered share of diseased leaves rises
+    share(t) = infected_area(spread, 1, t) / visible_incidence(spread, 1, t)
+    @test share(150.0) < share(200.0) < share(280.0)
+
+    # without spread the cover stays at cover0, with shedding, cohorts and inoculation
+    fixed = solve(MildewProblem(MildewParameters(; common..., cover0 = 0.4), fill(g, 2), 0.05))
+    for s in 1:2, t in (130.0, 200.0, 280.0), c in (nothing, 1, 2)
+        @test infected_area(fixed, s, t; cohort = c) ≈ 0.4 * visible_incidence(base, s, t; cohort = c) rtol = 1e-6
+    end
+    # fast spread covers diseased leaves almost at once
+    fast = solve(MildewProblem(MildewParameters(; common..., cover0 = 0.3, cover_rate = 50.0), g, 0.05))
+    @test infected_area(fast, 1, 200.0) ≈ visible_incidence(base, 1, 200.0) rtol = 1e-2
+
+    # closed form: one cohort, no maturation or latency, constant force b on leaves all present,
+    # so V = 1 - exp(-b t) and A' = σ₀ b exp(-b t) + r (V - A)
+    b, r, σ0 = 0.1, 0.05, 0.3
+    p = MildewParameters(; b_c = 0.0, b_a = 0.0, b_ext = b, cover0 = σ0, cover_rate = r)
+    sol = solve(MildewProblem(p, SeasonForcing(; tspan = (0.0, 40.0), leaves0 = 1.0), 0.0))
+    c = (σ0 * b - r) / (r - b)
+    for t in (5.0, 10.0, 40.0)
+        @test infected_area(sol, 1, t) ≈ 1 + c * exp(-b * t) - (1 + c) * exp(-r * t) rtol = 1e-8
+    end
+    # leaves that sporulate at once (L = 0) are covered σ₀ when inoculated
+    p0 = MildewParameters(; b_c = 0.0, b_a = 0.0, cover0 = 0.4)
+    f0 = SeasonForcing(; tspan = (0.0, 30.0), leaves0 = 1.0, inoculations = [(10.0, 0.7)])
+    s0 = solve(MildewProblem(p0, f0, 0.0))
+    @test infected_area(s0, 1, 20.0) ≈ 0.4 * (1 - exp(-0.7)) rtol = 1e-10
+
+    # the spatial model has the same cover
+    h = SeasonForcing(; tspan = (90.0, 280.0), production = prod, release)
+    q = MildewParameters(; common..., cover0 = 0.3, cover_rate = 0.05)
+    ssol = solve(SpatialMildewProblem(q, Landscape(ones(1, 2); cellsize = 1.0), Dispersal(; rho = 0.0, ell = 1.0), h, 0.05))
+    nsol = solve(MildewProblem(q, h, 0.05))
+    @test infected_area(ssol, 1, 250.0) ≈ fill(infected_area(nsol, 1, 250.0), 2) rtol = 1e-6
+    @test infected_area(ssol, 1, 250.0; cohort = 2) ≈ fill(infected_area(nsol, 1, 250.0; cohort = 2), 2) rtol = 1e-6
+
+    @test_throws ArgumentError MildewParameters(; common..., cover0 = 0.0)
+    @test_throws ArgumentError MildewParameters(; common..., cover0 = 1.5)
+    @test_throws ArgumentError MildewParameters(; common..., cover0 = 0.5, cover_rate = -1.0)
+    @test_throws ArgumentError MildewParameters(; common..., cover0 = 0.5, cover_rate = Inf)
+    @test_throws ArgumentError infected_area(spread, 1, 200.0; cohort = 3)
+end

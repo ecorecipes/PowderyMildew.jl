@@ -271,6 +271,12 @@ function visible_incidence(sol::SpatialMildewSolution, season::Integer, t::Real;
     return [stand_visible_incidence(p, view(U, :, j), latent_visible, cohort) for j in axes(U, 2)]
 end
 
+function infected_area(sol::SpatialMildewSolution, season::Integer, t::Real; cohort = nothing)
+    p, U = sol.prob.p, sol(season, t)
+    check_cohort(p, cohort)
+    return [stand_infected_area(p, view(U, :, j), cohort) for j in axes(U, 2)]
+end
+
 """
     regional_incidence(sol::SpatialMildewSolution, season, t; visible = false, latent_visible = 0.0)
 

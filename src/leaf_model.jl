@@ -19,6 +19,9 @@
 # forcing. With `cohorts` > 1 the leaf block U … Z is repeated once per leaf cohort (flushes,
 # say), each with its own production, shedding weight w and D, all sharing λ; I in λ and W is
 # the sum over cohorts. The state is [block₁ … block_n, C, W];
+# with colony spread (cover0 < 1) it ends with one A per cohort, the diseased leaf area
+# actually covered by mildew: A' = σ₀ (leaves turning visible) + ρ_A (I + Z − A) − δ A, so a leaf
+# is covered σ₀ when it shows mildew and its colonies spread over the rest at rate ρ_A;
 # and the winter map C_{a+1} = c_w W_a (or c_w I_a(end) with `gate = nothing`). With all
 # leaves present at the start, τ_s = ∞, no latency, a pulse release and the end-of-season
 # gate, it is the one-species model of Hamelin et al. (2016) with β = b_c, α = γ_I and
@@ -27,7 +30,8 @@
 """
     MildewParameters(; b_c, b_a, b_ext = 0.0, tau_s = Inf, K = 1, epsilon = 0.0, latent = 0.0,
                      L = 0, gamma_I = 0.0, c_w = 1.0, shed = 0.0, shed_severity = 0.0,
-                     shed_power = 1.0, cohorts = 1, cohort_shedding = ones(cohorts))
+                     shed_power = 1.0, cohorts = 1, cohort_shedding = ones(cohorts), cover0 = 1.0,
+                     cover_rate = 0.0)
 
 Parameters of the leaf-level model:
 - `b_c`: secondary (conidial) transmission per day per unit sporulating leaf fraction;
@@ -53,7 +57,16 @@ Parameters of the leaf-level model:
   the force of infection, and the sporulating leaves of all of them make conidia and next year's
   inoculum. With one cohort the model is unchanged;
 - `cohort_shedding`: the weight `w` of each cohort in the shedding rate, e.g. `[0, 1]` for
-  shedding of later-flush leaves only.
+  shedding of later-flush leaves only;
+- `cover0`: the share of a leaf's area covered by mildew when it first shows mildew (becomes
+  sporulating). Below 1 the model tracks, per cohort, the diseased leaf area actually covered,
+  `A' = cover0 × (leaves turning visible) + cover_rate (I + Z − A) − δ A`, so colonies spread
+  over the rest of each diseased leaf at rate `cover_rate` (per day) and shed leaves take their
+  cover with them; [`infected_area`](@ref) reports it. Spread changes the leaf area infected,
+  not the force of infection: a diseased leaf sporulates, and makes next year's inoculum, as
+  before. `cover0 = 1` (the default) adds no state, and every leaf showing mildew counts as
+  fully covered;
+- `cover_rate`: the rate of that spread (0 by default, so the cover stays at `cover0`).
 """
 struct MildewParameters
     b_c::Float64
@@ -71,8 +84,14 @@ struct MildewParameters
     shed_power::Float64
     cohorts::Int
     cohort_shedding::Vector{Float64}
+    cover0::Float64
+    cover_rate::Float64
     function MildewParameters(b_c, b_a, b_ext, tau_s, K, epsilon, latent, L, gamma_I, c_w, shed = 0.0,
-                              shed_severity = 0.0, shed_power = 1.0, cohorts = 1, cohort_shedding = ones(cohorts))
+                              shed_severity = 0.0, shed_power = 1.0, cohorts = 1, cohort_shedding = ones(cohorts),
+                              cover0 = 1.0, cover_rate = 0.0)
+        0 < cover0 ≤ 1 || throw(ArgumentError("cover0 must be in (0, 1], got $cover0"))
+        isfinite(cover_rate) && cover_rate ≥ 0 ||
+            throw(ArgumentError("cover_rate must be finite and nonnegative, got $cover_rate"))
         for (name, v) in (("b_c", b_c), ("b_a", b_a), ("b_ext", b_ext), ("gamma_I", gamma_I), ("c_w", c_w),
                           ("shed", shed), ("shed_severity", shed_severity))
             isfinite(v) && v ≥ 0 || throw(ArgumentError("$name must be finite and nonnegative, got $v"))
@@ -94,16 +113,17 @@ struct MildewParameters
             isfinite(latent) && latent > 0 || throw(ArgumentError("latent must be finite and positive when L > 0, got $latent"))
         end
         return new(b_c, b_a, b_ext, tau_s, K, epsilon, latent, L, gamma_I, c_w, shed, shed_severity, shed_power,
-                   cohorts, collect(Float64, cohort_shedding))
+                   cohorts, collect(Float64, cohort_shedding), cover0, cover_rate)
     end
 end
 
 function MildewParameters(; b_c, b_a, b_ext = 0.0, tau_s = Inf, K = 1, epsilon = 0.0, latent = 0.0, L = 0,
                           gamma_I = 0.0, c_w = 1.0, shed = 0.0, shed_severity = 0.0, shed_power = 1.0, cohorts = 1,
-                          cohort_shedding = ones(cohorts))
+                          cohort_shedding = ones(cohorts), cover0 = 1.0, cover_rate = 0.0)
     return MildewParameters(Float64(b_c), Float64(b_a), Float64(b_ext), Float64(tau_s), Int(K), Float64(epsilon),
                             Float64(latent), Int(L), Float64(gamma_I), Float64(c_w), Float64(shed),
-                            Float64(shed_severity), Float64(shed_power), Int(cohorts), cohort_shedding)
+                            Float64(shed_severity), Float64(shed_power), Int(cohorts), cohort_shedding,
+                            Float64(cover0), Float64(cover_rate))
 end
 
 """
@@ -296,14 +316,18 @@ function inoculate!(u, p::MildewParameters, f, t)
         x = dose * f.weather(t)
         for c in 1:(p.cohorts)
             target = p.L == 0 ? sporulating(p, c) : first(latent_stages(p, c))
+            total = zero(eltype(u))
             for k in young(p, c)
                 infected = -expm1(-x) * u[k]
                 u[k] -= infected
-                u[target] += infected
+                total += infected
             end
             infected = -expm1(-p.epsilon * x) * u[mature(p, c)]
             u[mature(p, c)] -= infected
-            u[target] += infected
+            total += infected
+            u[target] += total
+            # leaves that sporulate at once show mildew at once
+            p.L == 0 && spreads(p) && (u[covered(p, c)] += p.cover0 * total)
         end
     end
     return u
@@ -316,10 +340,13 @@ function inoculation_callback(p::MildewParameters, f)
     return SciMLBase.DiscreteCallback(condition, affect!)
 end
 
-# state layout: one block [U₁ … U_K, M, E₁ … E_L, I, Z] per cohort, then C and W
+# state layout: one block [U₁ … U_K, M, E₁ … E_L, I, Z] per cohort, then C and W, then (with
+# colony spread) the covered area A of each cohort
 block_size(p::MildewParameters) = p.K + p.L + 3
 offset(p::MildewParameters, c) = (c - 1) * block_size(p)
-nstate(p::MildewParameters) = p.cohorts * block_size(p) + 2
+spreads(p::MildewParameters) = p.cover0 < 1
+nstate(p::MildewParameters) = p.cohorts * block_size(p) + 2 + (spreads(p) ? p.cohorts : 0)
+covered(p, c = 1) = p.cohorts * block_size(p) + 2 + c
 young(p, c = 1) = offset(p, c) .+ (1:(p.K))
 mature(p, c = 1) = offset(p, c) + p.K + 1
 latent_stages(p, c = 1) = offset(p, c) .+ ((p.K + 2):(p.K + 1 + p.L))
@@ -375,6 +402,7 @@ function leaf_rhs!(du, u, p::MildewParameters, f, t, conidia)
         new_infections = λ * susceptible
         δ = shedding_rate(p, s, c, u)
         if L == 0
+            visible_inflow = new_infections
             du[iI] = new_infections - (p.gamma_I + δ) * u[iI]
         else
             e1 = o + K + 2
@@ -382,9 +410,14 @@ function leaf_rhs!(du, u, p::MildewParameters, f, t, conidia)
             @inbounds for j in (e1 + 1):(o + K + 1 + L)
                 du[j] = rate * (u[j - 1] - u[j])
             end
-            @inbounds du[iI] = rate * u[o + K + 1 + L] - (p.gamma_I + δ) * u[iI]
+            visible_inflow = rate * u[o + K + 1 + L]
+            @inbounds du[iI] = visible_inflow - (p.gamma_I + δ) * u[iI]
         end
         du[iZ] = p.gamma_I * u[iI] - δ * u[iZ]
+        if spreads(p)
+            iA = covered(p, c)
+            du[iA] = p.cover0 * visible_inflow + p.cover_rate * (u[iI] + u[iZ] - u[iA]) - δ * u[iA]
+        end
         total_sporulating += u[iI]
     end
     du[iC] = -g * u[iC]
@@ -491,6 +524,7 @@ function season_start!(u0, p::MildewParameters, f, C)
         infected = -expm1(-p.b_a * C * f.weather(f.tspan[1]))
         u0[1] = f.leaves0 * (1 - infected)
         u0[p.L == 0 ? sporulating(p) : first(latent_stages(p))] = f.leaves0 * infected
+        p.L == 0 && spreads(p) && (u0[covered(p)] = p.cover0 * f.leaves0 * infected)
     else
         u0[inoculum(p)] = C
     end
@@ -524,6 +558,12 @@ stand_sporulating(p::MildewParameters, u) = sum(u[sporulating(p, k)] for k in 1:
 function stand_visible(p::MildewParameters, u, latent_visible, c = nothing)
     return sum(u[sporulating(p, k)] + u[spent(p, k)] + latent_visible * sum(@view u[latent_stages(p, k)]; init = 0.0)
                for k in cohorts_of(p, c))
+end
+function stand_infected_area(p::MildewParameters, u, c = nothing)
+    A = stand_leaves(p, u, c)
+    A > 0 || return 0.0
+    spreads(p) || return stand_visible(p, u, 0.0, c) / A
+    return sum(u[covered(p, k)] for k in cohorts_of(p, c)) / A
 end
 function stand_incidence(p::MildewParameters, u, c = nothing)
     A = stand_leaves(p, u, c)
@@ -565,6 +605,20 @@ function visible_incidence(sol::MildewSolution, season::Integer, t::Real; latent
     check_latent_visible(latent_visible)
     check_cohort(sol.prob.p, cohort)
     return stand_visible_incidence(sol.prob.p, sol(season, t), latent_visible, cohort)
+end
+
+"""
+    infected_area(sol, season, t; cohort = nothing)
+
+The share of the leaf area present on day `t` of `season` that is covered by mildew; of one
+leaf cohort only with `cohort`. Without colony spread (`cover0 = 1` in
+[`MildewParameters`](@ref)) every leaf showing mildew counts as fully covered, so this is
+[`visible_incidence`](@ref); with spread, it is the covered area `A` over the leaves present. For
+a [`SpatialMildewSolution`](@ref), one value per stand.
+"""
+function infected_area(sol::MildewSolution, season::Integer, t::Real; cohort = nothing)
+    check_cohort(sol.prob.p, cohort)
+    return stand_infected_area(sol.prob.p, sol(season, t), cohort)
 end
 
 """
