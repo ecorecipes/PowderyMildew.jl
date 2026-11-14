@@ -46,6 +46,9 @@
 #           share of leaf area (`infected_area`) instead of the share of leaves showing mildew.
 #           cover0 on the logit scale (prior median 0.3, log-odds sd 1.5), cover_rate on the log
 #           scale (prior median 0.03 per day, log-sd 1.5).
+#   efficacy  the fungicide's efficacy fitted (logit scale, prior median 0.9, log-odds sd 1.5):
+#           protection just after a spray is partial, `1 - efficacy` of the force of infection
+#           getting through; otherwise fixed at 1.
 #   A start for the added parameters (log scale) may follow the variant on the command line; the
 #   values replace the last entries of the start vector, so a full vector replaces all of it.
 #
@@ -70,7 +73,7 @@ mkpath(OUT)
 const VARIANT = length(ARGS) ≥ 2 ? ARGS[2] : "base"
 const OPTIONS = Set(split(VARIANT, '+'))
 issubset(OPTIONS, Set(["base", "winter", "dates", "shed", "severity", "drought", "power", "late", "shoots", "sizes", "mean2010", "epsilon",
-                       "tauprior", "spread"])) ||
+                       "tauprior", "spread", "efficacy"])) ||
     error("unknown variant: $VARIANT")
 const WINTER, UNDATED, SHED = "winter" in OPTIONS, "dates" in OPTIONS, "shed" in OPTIONS
 const SEVERITY, DROUGHT = "severity" in OPTIONS, "drought" in OPTIONS
@@ -94,6 +97,8 @@ const EPSILON = "epsilon" in OPTIONS
 const IEPS = ISIZE + 2SIZES     # logit of the mature leaves' relative susceptibility
 const TAUPRIOR, SPREAD = "tauprior" in OPTIONS, "spread" in OPTIONS
 const ISPREAD = IEPS + EPSILON  # logit cover0, then log cover_rate
+const EFFICACY = "efficacy" in OPTIONS
+const IEFF = ISPREAD + 2SPREAD  # logit of the fungicide's efficacy
 logistic(x) = 1 / (1 + exp(-x))
 
 function readcsv(path)
@@ -198,15 +203,18 @@ const DAYS = collect(91.0:1.0:299.0)
 # Ascospore release peaks a fitted lag after each year's budburst (score 2; 2009, emergence), so
 # that it follows the same spring warmth as the host. The 2009 release has no source (C0 = 0).
 const BUDBURST = Dict(y => FLUSH[y].dates[1] for y in YEARS)
-# Fungicide efficacy is fixed at 1 (full protection just after a spray): fitted, it went to the
-# bound, with or without a free decay (wiki: oak/barres-fit.md). The decay is fitted.
+# Fungicide efficacy is fixed at 1 (full protection just after a spray) unless "efficacy": fitted
+# in fits 4-5, it went to the bound, with or without a free decay (wiki: oak/barres-fit.md). The
+# decay is fitted.
 const NAMES = ["b_c", "b_ext", "c_w", "dose", "tau_s", "release_lag", "fungicide_decay", "obs_sd",
                (WINTER ? ["winter_2011"] : String[])..., (SHED ? ["shed"] : String[])...,
                (SEVERITY ? ["shed_severity"] : String[])..., (DROUGHT ? ["shed_drought"] : String[])...,
                (POWER ? ["shed_power"] : String[])..., (SIZES ? ["later_2010", "later_2011"] : String[])...,
-               (EPSILON ? ["epsilon"] : String[])..., (SPREAD ? ["cover0", "cover_rate"] : String[])...]
+               (EPSILON ? ["epsilon"] : String[])..., (SPREAD ? ["cover0", "cover_rate"] : String[])...,
+               (EFFICACY ? ["efficacy"] : String[])...]
 function unpack(θ)
-    return (b_c = exp(θ[1]), b_ext = exp(θ[2]), c_w = exp(θ[3]), efficacy = 1.0, dose = exp(θ[4]),
+    return (b_c = exp(θ[1]), b_ext = exp(θ[2]), c_w = exp(θ[3]), efficacy = EFFICACY ? logistic(θ[IEFF]) : 1.0,
+            dose = exp(θ[4]),
             tau_s = exp(θ[5]), lag = θ[6], decay = exp(θ[7]), sd = exp(θ[8]),
             winter = WINTER ? exp(θ[9]) : 1.0,
             shed = SHED ? exp(θ[ISHED]) : DROUGHT ? exp(θ[IDRY]) : 0.0,
@@ -311,7 +319,8 @@ logprior(θ, q) = -0.5 * (q.lag / 15)^2 - 0.5 * ((θ[7] - log(10.0)) / 0.7)^2 -
                  (SIZES ? 0.5 * sum(abs2, θ[ISIZE:(ISIZE + 1)] ./ 1.5) : 0.0) -
                  (EPSILON ? 0.5 * ((θ[IEPS] - logit(0.05)) / 1.5)^2 : 0.0) -
                  (TAUPRIOR ? 0.5 * ((θ[5] - log(12.0)) / 0.35)^2 : 0.0) -
-                 (SPREAD ? 0.5 * ((θ[ISPREAD] - logit(0.3)) / 1.5)^2 + 0.5 * ((θ[ISPREAD + 1] - log(0.03)) / 1.5)^2 : 0.0)
+                 (SPREAD ? 0.5 * ((θ[ISPREAD] - logit(0.3)) / 1.5)^2 + 0.5 * ((θ[ISPREAD + 1] - log(0.03)) / 1.5)^2 : 0.0) -
+                 (EFFICACY ? 0.5 * ((θ[IEFF] - logit(0.9)) / 1.5)^2 : 0.0)
 
 function negloglik(θ)
     q = unpack(θ)
@@ -363,6 +372,7 @@ if SIZES && SHOOTS && UNDATED && WINTER && !(SHED || SEVERITY || DROUGHT || MEAN
 end
 EPSILON && push!(θ0, logit(0.05))
 SPREAD && push!(θ0, logit(0.3), log(0.03))
+EFFICACY && push!(θ0, logit(0.9))
 # a start for the added rates on the command line: julia ... outdir variant log_rate...
 length(ARGS) > 2 && (θ0[(end - length(ARGS) + 3):end] = parse.(Float64, ARGS[3:end]))
 @printf("variant %s: start %.3f\n", VARIANT, negloglik(θ0))
@@ -433,7 +443,7 @@ open(joinpath(OUT, "fit.txt"), "w") do io
                                count(l -> l[1] == y, labels)) for y in YEARS), ", "))
         println(out, "optimum on the unconstrained scale: ", θ̂)
         println(out, "parameter          estimate   (95% interval from the Laplace approximation)")
-        tr = [k == 6 ? identity : startswith(NAMES[k], "later") || NAMES[k] in ("epsilon", "cover0") ? logistic : exp
+        tr = [k == 6 ? identity : startswith(NAMES[k], "later") || NAMES[k] in ("epsilon", "cover0", "efficacy") ? logistic : exp
               for k in eachindex(NAMES)]
         for (k, name) in enumerate(NAMES)
             @printf(out, "%-18s %9.4g   (%.4g, %.4g)\n", name, tr[k](θ̂[k]), tr[k](θ̂[k] - 1.96se[k]), tr[k](θ̂[k] + 1.96se[k]))
