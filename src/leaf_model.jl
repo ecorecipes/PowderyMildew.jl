@@ -489,12 +489,16 @@ function (sol::MildewSolution)(season::Integer, t::Real)
 end
 
 """
-    solve(prob::MildewProblem; alg = Tsit5(), abstol = 1e-12, reltol = 1e-10)
+    solve(prob::MildewProblem; alg = Tsit5(), abstol = 1e-12, reltol = 1e-10, kwargs...)
 
 Integrate each season of `prob` and apply the winter map between seasons. Returns a
-[`MildewSolution`](@ref).
+[`MildewSolution`](@ref). Other keyword arguments go to the ODE solver for every season: for
+example `saveat = 90:300, dense = false` keeps only whole days, which is much cheaper when the
+solution is only read on those days (`sol(season, t)` is then linear between saved days; the step
+sequence and the states on saved days are unchanged, so values there agree with the dense
+solution to rounding).
 """
-function CommonSolve.solve(prob::MildewProblem; alg = Tsit5(), abstol = 1e-12, reltol = 1e-10)
+function CommonSolve.solve(prob::MildewProblem; alg = Tsit5(), abstol = 1e-12, reltol = 1e-10, kwargs...)
     p = prob.p
     C = prob.C0
     seasons = []
@@ -504,9 +508,9 @@ function CommonSolve.solve(prob::MildewProblem; alg = Tsit5(), abstol = 1e-12, r
         season_start!(u0, p, f, C)
         ode = ODEProblem(LeafRHS(p, f), u0, f.tspan)
         s = if isempty(f.inoculations)
-            CommonSolve.solve(ode, alg; abstol, reltol, tstops = f.tstops)
+            CommonSolve.solve(ode, alg; abstol, reltol, tstops = f.tstops, kwargs...)
         else
-            CommonSolve.solve(ode, alg; abstol, reltol, tstops = f.tstops, callback = inoculation_callback(p, f))
+            CommonSolve.solve(ode, alg; abstol, reltol, tstops = f.tstops, callback = inoculation_callback(p, f), kwargs...)
         end
         SciMLBase.successful_retcode(s) || throw(SolverError("season integration failed with retcode $(s.retcode)"))
         push!(seasons, s)

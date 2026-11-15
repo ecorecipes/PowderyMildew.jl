@@ -77,6 +77,16 @@ using Distributions: Normal, cdf
         @test u[end] ≈ integral rtol = 1e-5
         @test winter_inoculum(sol)[1] ≈ 0.02 * u[end]
         @test sol(2, 90.0)[end - 1] ≈ winter_inoculum(sol)[1]
+        # solver keywords pass through: saving whole days only leaves the step sequence, the
+        # stored states on those days and the winter map unchanged (the dense interpolant evaluated
+        # at a step differs from the stored state by rounding only)
+        light = solve(MildewProblem(p, fill(f, 3), 1.0); saveat = 90:280, dense = false)
+        @test length(light.seasons[1].t) == 191
+        @test [s.stats.naccept for s in light.seasons] == [s.stats.naccept for s in sol.seasons]
+        @test all(light.seasons[s].u[i] == sol.seasons[s].u[findfirst(==(t), sol.seasons[s].t)]
+                  for s in 1:3 for (i, t) in enumerate(light.seasons[s].t))
+        @test all(isapprox(sol(s, t), light(s, t); rtol = 1e-12) for s in 1:3, t in 90.0:280.0)
+        @test winter_inoculum(light) == winter_inoculum(sol)
     end
 
     @testset "forcing helpers" begin
