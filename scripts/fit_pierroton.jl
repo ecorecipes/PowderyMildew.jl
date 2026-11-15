@@ -54,9 +54,19 @@
 #           prior mean 0, sd 1 (a factor of e per 10 points of RH at one sd).
 #   rain    the force of infection times exp(-r) on wet days (precipitation >= 1 mm): r > 0 if rain
 #           suppresses infection (conidia washed off or burst); r normal, prior mean 0, sd 1.5.
+#   rain5   with "rain", a wet day needs at least 5 mm (also for "wetrelease").
+#   rainlog with "rain", the factor is exp(-r log(1 + P)) with P the day's precipitation (mm), so
+#           the effect grows with the amount instead of switching at a threshold.
+#   wetrelease  the overwintered ascospores are released at a fraction w of the rate on dry days
+#           (`ReleaseHazard(; wet)`: w + (1 - w) on wet days, so 1 on wet days), w fitted on the logit
+#           scale, prior median 0.5, log-odds sd 1.5; w = 1 is the model without it. Chasmothecia
+#           of powdery mildews generally need wetting to discharge.
 #   gap     with "dates", the profiled undated scores are at least 7 days from each other and from
 #           the dated scores either side (otherwise any whole days strictly between them): field
 #           scorings a day apart cannot differ as much as consecutive scores sometimes do.
+#   june2011  with "dates", both undated 2011 scores (oid3_11, oid4_11) no later than 20 June, when
+#           the third flush was noted: an assumption (there is no third-shoot score), to test the
+#           fits that move oid4_11 to late July.
 #   A start for the added parameters (log scale) may follow the variant on the command line; the
 #   values replace the last entries of the start vector, so a full vector replaces all of it.
 #
@@ -81,7 +91,8 @@ mkpath(OUT)
 const VARIANT = length(ARGS) ≥ 2 ? ARGS[2] : "base"
 const OPTIONS = Set(split(VARIANT, '+'))
 issubset(OPTIONS, Set(["base", "winter", "dates", "shed", "severity", "drought", "power", "late", "shoots", "sizes", "mean2010", "epsilon",
-                       "tauprior", "spread", "efficacy", "humidity", "rain", "gap"])) ||
+                       "tauprior", "spread", "efficacy", "humidity", "rain", "gap", "rain5", "rainlog",
+                       "wetrelease", "june2011"])) ||
     error("unknown variant: $VARIANT")
 const WINTER, UNDATED, SHED = "winter" in OPTIONS, "dates" in OPTIONS, "shed" in OPTIONS
 const SEVERITY, DROUGHT = "severity" in OPTIONS, "drought" in OPTIONS
@@ -110,9 +121,17 @@ const IEFF = ISPREAD + 2SPREAD  # logit of the fungicide's efficacy
 const HUMID, RAIN = "humidity" in OPTIONS, "rain" in OPTIONS
 const IHUM = IEFF + EFFICACY    # humidity coefficient h, then the wet-day coefficient r
 const IRAIN = IHUM + HUMID
+const RAIN5, RAINLOG, WETREL = "rain5" in OPTIONS, "rainlog" in OPTIONS, "wetrelease" in OPTIONS
+(RAIN5 || RAINLOG) && !RAIN && error("\"rain5\" and \"rainlog\" need \"rain\"")
+RAIN5 && RAINLOG && error("\"rain5\" and \"rainlog\" are alternatives; use one")
+const WET_MM = RAIN5 ? 5.0 : 1.0   # the wet-day threshold
+const IWREL = IRAIN + RAIN       # logit of the dry-day share of ascospore release
 # with "gap", the profiled undated scores are at least GAP days from each other and from the dated
 # scores either side (whole days strictly between them otherwise, GAP = 1)
 const GAP = "gap" in OPTIONS ? 7 : 1
+# with "june2011", both undated 2011 scores no later than 20 June, when the third flush was noted
+# (an assumption: there is no third-shoot score, as if scoring came before that flush)
+const LATEST = "june2011" in OPTIONS ? Dict("oid3_11" => 171, "oid4_11" => 171) : Dict{String,Int}()   # 171 = 20 June 2011
 logistic(x) = 1 / (1 + exp(-x))
 
 function readcsv(path)
@@ -154,8 +173,12 @@ temperature = Dict(y => DailySeries([parse(Float64, r["tmean"]) for r in weather
 # daily mean relative humidity (%) and wet days (precipitation >= 1 mm), for "humidity" and "rain"
 rel_humidity = Dict(y => DailySeries([parse(Float64, r["rh_mean"]) for r in weather_rows if r["year"] == string(y)])
                     for y in YEARS)
-wet_day = Dict(y => DailySeries([parse(Float64, r["precip"]) ≥ 1.0 ? 1.0 : 0.0 for r in weather_rows if r["year"] == string(y)])
+wet_day = Dict(y => DailySeries([parse(Float64, r["precip"]) ≥ WET_MM ? 1.0 : 0.0 for r in weather_rows if r["year"] == string(y)])
                for y in YEARS)
+# the covariate of "rain": the wet-day indicator, or log(1 + P) with "rainlog"
+rain_cov = RAINLOG ?
+           Dict(y => DailySeries([log1p(parse(Float64, r["precip"])) for r in weather_rows if r["year"] == string(y)]) for y in YEARS) :
+           wet_day
 
 # Soil-water deficit for "drought": 1 - S/CAPACITY, with S' = rain - ET0 S/CAPACITY and ET0 from
 # Hargreaves (FAO-56 extraterrestrial radiation at the site's latitude). The capacity is an
@@ -232,7 +255,7 @@ const NAMES = ["b_c", "b_ext", "c_w", "dose", "tau_s", "release_lag", "fungicide
                (POWER ? ["shed_power"] : String[])..., (SIZES ? ["later_2010", "later_2011"] : String[])...,
                (EPSILON ? ["epsilon"] : String[])..., (SPREAD ? ["cover0", "cover_rate"] : String[])...,
                (EFFICACY ? ["efficacy"] : String[])..., (HUMID ? ["humidity"] : String[])...,
-               (RAIN ? ["rain"] : String[])...]
+               (RAIN ? ["rain"] : String[])..., (WETREL ? ["dry_release"] : String[])...]
 function unpack(θ)
     return (b_c = exp(θ[1]), b_ext = exp(θ[2]), c_w = exp(θ[3]), efficacy = EFFICACY ? logistic(θ[IEFF]) : 1.0,
             dose = exp(θ[4]),
@@ -243,15 +266,22 @@ function unpack(θ)
             later = SIZES ? Dict(2010 => logistic(θ[ISIZE]), 2011 => logistic(θ[ISIZE + 1])) : Dict{Int,Float64}(),
             epsilon = EPSILON ? logistic(θ[IEPS]) : 0.05,
             cover0 = SPREAD ? logistic(θ[ISPREAD]) : 1.0, cover_rate = SPREAD ? exp(θ[ISPREAD + 1]) : 0.0,
-            humid = HUMID ? θ[IHUM] : 0.0, rain = RAIN ? θ[IRAIN] : 0.0)
+            humid = HUMID ? θ[IHUM] : 0.0, rain = RAIN ? θ[IRAIN] : 0.0,
+            dry_release = WETREL ? logistic(θ[IWREL]) : 1.0)
 end
 # the moisture factor on the force of infection ("humidity", "rain"; 1 otherwise)
 # (the series are looked up once, outside the closure: the dictionaries are untyped globals, and a
 # lookup on every right-hand-side call made each evaluation about 3 times slower)
 function moisture(q, y)
     (HUMID || RAIN) || return t -> 1.0
-    RH, W, h, r = rel_humidity[y], wet_day[y], q.humid, q.rain
+    RH, W, h, r = rel_humidity[y], rain_cov[y], q.humid, q.rain
     return t -> exp(-h * (RH(t) - 70) / 10 - r * W(t))
+end
+# the wet gate on ascospore release ("wetrelease"): w on dry days, 1 on wet days
+function release_gate(q, y)
+    WETREL || return t -> 1.0
+    W, w = wet_day[y], q.dry_release
+    return t -> w + (1 - w) * W(t)
 end
 
 function simulate(q, treatment)
@@ -262,7 +292,7 @@ function simulate(q, treatment)
                          cover_rate = q.cover_rate)
     forcings = map(YEARS) do y
         T = temperature[y]
-        release = ReleaseHazard(; rate = 0.2, optimum = BUDBURST[y] + q.lag, curvature = -0.003)
+        release = ReleaseHazard(; rate = 0.2, optimum = BUDBURST[y] + q.lag, curvature = -0.003, wet = release_gate(q, y))
         spray = treatment == "L" ? FungicideSchedule(FUNGICIDE[y]; efficacy = q.efficacy, decay = q.decay) : t -> 1.0
         inoc = treatment == "H" ? [(d, q.dose) for d in INOCULATION[y]] : Tuple{Float64,Float64}[]
         wet = moisture(q, y)
@@ -321,6 +351,7 @@ function fitted(q)
             s1, s2 = ssr(c1), ssr(c2)
             for (s, c) in ((s1, c1), (s2, c2)), i in eachindex(days)
                 days[i] < get(EARLIEST, c, 0) && (s[i] = Inf)
+                days[i] > get(LATEST, c, typemax(Int)) && (s[i] = Inf)
             end
             best, i1, i2, low, at = Inf, 0, 0, Inf, 0
             for j in (1 + GAP):length(days)   # best i1 ≤ i2 - GAP: running minimum of s1 up to j - GAP
@@ -355,7 +386,8 @@ logprior(θ, q) = -0.5 * (q.lag / 15)^2 - 0.5 * ((θ[7] - log(10.0)) / 0.7)^2 -
                  (TAUPRIOR ? 0.5 * ((θ[5] - log(12.0)) / 0.35)^2 : 0.0) -
                  (SPREAD ? 0.5 * ((θ[ISPREAD] - logit(0.3)) / 1.5)^2 + 0.5 * ((θ[ISPREAD + 1] - log(0.03)) / 1.5)^2 : 0.0) -
                  (EFFICACY ? 0.5 * ((θ[IEFF] - logit(0.9)) / 1.5)^2 : 0.0) -
-                 (HUMID ? 0.5 * θ[IHUM]^2 : 0.0) - (RAIN ? 0.5 * (θ[IRAIN] / 1.5)^2 : 0.0)
+                 (HUMID ? 0.5 * θ[IHUM]^2 : 0.0) - (RAIN ? 0.5 * (θ[IRAIN] / 1.5)^2 : 0.0) -
+                 (WETREL ? 0.5 * (θ[IWREL] / 1.5)^2 : 0.0)
 
 function negloglik(θ)
     q = unpack(θ)
@@ -410,6 +442,7 @@ SPREAD && push!(θ0, logit(0.3), log(0.03))
 EFFICACY && push!(θ0, logit(0.9))
 HUMID && push!(θ0, 0.0)
 RAIN && push!(θ0, 0.0)
+WETREL && push!(θ0, logit(0.9))
 # a start for the added rates on the command line: julia ... outdir variant log_rate...
 length(ARGS) > 2 && (θ0[(end - length(ARGS) + 3):end] = parse.(Float64, ARGS[3:end]))
 @printf("variant %s: start %.3f\n", VARIANT, negloglik(θ0))
@@ -480,7 +513,7 @@ open(joinpath(OUT, "fit.txt"), "w") do io
                                count(l -> l[1] == y, labels)) for y in YEARS), ", "))
         println(out, "optimum on the unconstrained scale: ", θ̂)
         println(out, "parameter          estimate   (95% interval from the Laplace approximation)")
-        tr = [k == 6 || NAMES[k] in ("humidity", "rain") ? identity : startswith(NAMES[k], "later") || NAMES[k] in ("epsilon", "cover0", "efficacy") ? logistic : exp
+        tr = [k == 6 || NAMES[k] in ("humidity", "rain") ? identity : startswith(NAMES[k], "later") || NAMES[k] in ("epsilon", "cover0", "efficacy", "dry_release") ? logistic : exp
               for k in eachindex(NAMES)]
         for (k, name) in enumerate(NAMES)
             @printf(out, "%-18s %9.4g   (%.4g, %.4g)\n", name, tr[k](θ̂[k]), tr[k](θ̂[k] - 1.96se[k]), tr[k](θ̂[k] + 1.96se[k]))
