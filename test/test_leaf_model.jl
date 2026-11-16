@@ -121,5 +121,24 @@ using Distributions: Normal, cdf
         @test_throws ArgumentError sol(2, 1.0)
         @test_throws ArgumentError sol(1, 11.0)
         @test_throws ArgumentError visible_incidence(sol, 1, 1.0; latent_visible = 2)
+        @test_throws ArgumentError SeasonForcing(; tspan = (0, 10), external = -1.0)
+        @test_throws ArgumentError SeasonForcing(; tspan = (0, 10), external = Inf)
+    end
+
+    @testset "per-season outside input" begin
+        # external multiplies b_ext in its season only: external = e matches b_ext scaled by e
+        f(e) = SeasonForcing(; tspan = (0.0, 40.0), leaves0 = 1.0, external = e)
+        q(b) = MildewParameters(; b_c = 0.2, b_a = 0.0, b_ext = b, L = 2, latent = 6.0, gamma_I = 0.05, c_w = 0.1)
+        g = SeasonForcing(; tspan = (0.0, 40.0), leaves0 = 1.0)
+        for e in (0.0, 0.5, 2.0)
+            a = solve(MildewProblem(q(0.01), [f(e), g], 0.0))
+            b = solve(MildewProblem(q(0.01e), [g, g], 0.0))
+            @test a(1, 40.0) ≈ b(1, 40.0) rtol = 1e-8
+        end
+        # a later season keeps its own multiplier: no outside input in season 2 leaves season 1
+        # as it was and lowers season 2
+        a = solve(MildewProblem(q(0.01), [g, f(0.0)], 0.0))
+        @test a(1, 40.0) ≈ solve(MildewProblem(q(0.01), [g], 0.0))(1, 40.0)
+        @test incidence(a, 2, 40.0) < incidence(solve(MildewProblem(q(0.01), [g, g], 0.0)), 2, 40.0)
     end
 end

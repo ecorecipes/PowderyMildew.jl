@@ -9,7 +9,7 @@
 #   C          unreleased primary inoculum, in units of potential infections
 #   W          ∫ η(t) I(t) dt, the late-season source of next year's C
 #
-#   λ = f(t) (b_c I + b_a g(t) C + b_ext)
+#   λ = f(t) (b_c I + b_a g(t) C + b_ext e)   (e the season's `external` multiplier, default 1)
 #   U₁' = l(t) − (λ + K/τ_s) U₁,   U_k' = (K/τ_s)(U_{k−1} − U_k) − λ U_k,
 #   M'  = (K/τ_s) U_K − ε λ M,
 #   E₁' = λ (ΣU + ε M) − r E₁, …,   I' = r E_L − (γ_I + δ) I,   Z' = γ_I I − δ Z,   r = (L/latent) d(t),
@@ -253,7 +253,7 @@ end
 """
     SeasonForcing(; tspan, leaves0 = 0.0, production = t -> 0.0, release = t -> 0.0, pulse = false,
                   weather = t -> 1.0, development = t -> 1.0, shedding = t -> 1.0, gate = nothing,
-                  inoculations = [], tstops = Float64[])
+                  inoculations = [], tstops = Float64[], external = 1.0)
 
 The forcing of one season, over `tspan = (t0, t1)` in days (day of year, say):
 - `leaves0`: young susceptible leaves present at `t0`;
@@ -277,7 +277,9 @@ The forcing of one season, over `tspan = (t0, t1)` in days (day of year, say):
 - `inoculations`: added inoculum, as `(day, dose)` pairs with `t0 < day < t1`. At each, a share
   `1 - exp(-dose f(day))` of the young susceptible leaves (`1 - exp(-ε dose f(day))` of the mature
   ones) is infected at once, as when spores are blown onto seedlings;
-- `tstops`: times the solver must step to, such as day boundaries of daily forcings.
+- `tstops`: times the solver must step to, such as day boundaries of daily forcings;
+- `external`: a multiplier (≥ 0) of the outside force of infection `b_ext` in this season, so
+  that the outside input can differ between seasons.
 """
 struct SeasonForcing{P,R,F,D,S,G}
     tspan::Tuple{Float64,Float64}
@@ -291,21 +293,23 @@ struct SeasonForcing{P,R,F,D,S,G}
     gate::G
     inoculations::Vector{Tuple{Float64,Float64}}
     tstops::Vector{Float64}
+    external::Float64
 end
 
 function SeasonForcing(; tspan, leaves0 = 0.0, production = t -> 0.0, release = t -> 0.0, pulse::Bool = false,
                        weather = t -> 1.0, development = t -> 1.0, shedding = t -> 1.0, gate = nothing,
-                       inoculations = Tuple{Float64,Float64}[], tstops = Float64[])
+                       inoculations = Tuple{Float64,Float64}[], tstops = Float64[], external = 1.0)
     t0, t1 = Float64.(tspan)
     t0 < t1 || throw(ArgumentError("tspan must be increasing, got $tspan"))
     leaves0 ≥ 0 || throw(ArgumentError("leaves0 must be nonnegative, got $leaves0"))
+    isfinite(external) && external ≥ 0 || throw(ArgumentError("external must be finite and nonnegative, got $external"))
     inoc = sort!([(Float64(d), Float64(x)) for (d, x) in inoculations])
     for (d, x) in inoc
         t0 < d < t1 || throw(ArgumentError("inoculation day $d must lie strictly inside tspan $tspan"))
         isfinite(x) && x ≥ 0 || throw(ArgumentError("inoculation dose must be finite and nonnegative, got $x"))
     end
     return SeasonForcing((t0, t1), Float64(leaves0), production, release, pulse, weather, development, shedding,
-                         gate, inoc, sort!(unique!([collect(Float64, tstops); first.(inoc)])))
+                         gate, inoc, sort!(unique!([collect(Float64, tstops); first.(inoc)])), Float64(external))
 end
 
 # Apply the inoculations of forcing f that fall on day t to one stand's state u. Infected leaves
@@ -383,7 +387,7 @@ function leaf_rhs!(du, u, p::MildewParameters, f, t, conidia)
     K, L = p.K, p.L
     iC = inoculum(p)
     g = f.pulse ? 0.0 : f.release(t)
-    λ = f.weather(t) * (p.b_c * conidia + p.b_a * g * u[iC] + p.b_ext)
+    λ = f.weather(t) * (p.b_c * conidia + p.b_a * g * u[iC] + p.b_ext * f.external)
     age = isinf(p.tau_s) ? 0.0 : K / p.tau_s
     rate = L == 0 ? 0.0 : L / p.latent * f.development(t)
     s = p.shed == 0 && p.shed_severity == 0 ? 0.0 : f.shedding(t)

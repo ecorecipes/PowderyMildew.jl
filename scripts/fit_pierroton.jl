@@ -74,6 +74,9 @@
 #           on log(mean) over every 2009-2011 percent scoring (one link for all years and
 #           treatments). Residuals on the cloglog scale have their own sd (log-normal prior,
 #           median 0.5, log-sd 1), the regression's error included.
+#   ext2    the outside force of infection in 2010-11 is b_ext times a fitted ratio (the season's
+#           `external` multiplier; 2009, when the seedlings were newly sown with no local
+#           inoculum, keeps b_ext): log-normal prior, median 1, log-sd 2.
 #   A start for the added parameters (log scale) may follow the variant on the command line; the
 #   values replace the last entries of the start vector, so a full vector replaces all of it.
 #
@@ -99,7 +102,7 @@ const VARIANT = length(ARGS) ≥ 2 ? ARGS[2] : "base"
 const OPTIONS = Set(split(VARIANT, '+'))
 issubset(OPTIONS, Set(["base", "winter", "dates", "shed", "severity", "drought", "power", "late", "shoots", "sizes", "mean2010", "epsilon",
                        "tauprior", "spread", "efficacy", "humidity", "rain", "gap", "rain5", "rainlog",
-                       "wetrelease", "june2011", "presence"])) ||
+                       "wetrelease", "june2011", "presence", "ext2"])) ||
     error("unknown variant: $VARIANT")
 const WINTER, UNDATED, SHED = "winter" in OPTIONS, "dates" in OPTIONS, "shed" in OPTIONS
 const SEVERITY, DROUGHT = "severity" in OPTIONS, "drought" in OPTIONS
@@ -135,6 +138,8 @@ const WET_MM = RAIN5 ? 5.0 : 1.0   # the wet-day threshold
 const IWREL = IRAIN + RAIN       # logit of the dry-day share of ascospore release
 const PRESENCE = "presence" in OPTIONS
 const IPRES = IWREL + WETREL     # log of the presence residuals' sd
+const EXT2 = "ext2" in OPTIONS
+const IEXT = IPRES + PRESENCE    # log of the 2010-11 outside input relative to 2009's
 # with "gap", the profiled undated scores are at least GAP days from each other and from the dated
 # scores either side (whole days strictly between them otherwise, GAP = 1)
 const GAP = "gap" in OPTIONS ? 7 : 1
@@ -287,7 +292,7 @@ const NAMES = ["b_c", "b_ext", "c_w", "dose", "tau_s", "release_lag", "fungicide
                (EPSILON ? ["epsilon"] : String[])..., (SPREAD ? ["cover0", "cover_rate"] : String[])...,
                (EFFICACY ? ["efficacy"] : String[])..., (HUMID ? ["humidity"] : String[])...,
                (RAIN ? ["rain"] : String[])..., (WETREL ? ["dry_release"] : String[])...,
-               (PRESENCE ? ["presence_sd"] : String[])...]
+               (PRESENCE ? ["presence_sd"] : String[])..., (EXT2 ? ["ext_2010_11"] : String[])...]
 function unpack(θ)
     return (b_c = exp(θ[1]), b_ext = exp(θ[2]), c_w = exp(θ[3]), efficacy = EFFICACY ? logistic(θ[IEFF]) : 1.0,
             dose = exp(θ[4]),
@@ -299,7 +304,8 @@ function unpack(θ)
             epsilon = EPSILON ? logistic(θ[IEPS]) : 0.05,
             cover0 = SPREAD ? logistic(θ[ISPREAD]) : 1.0, cover_rate = SPREAD ? exp(θ[ISPREAD + 1]) : 0.0,
             humid = HUMID ? θ[IHUM] : 0.0, rain = RAIN ? θ[IRAIN] : 0.0,
-            dry_release = WETREL ? logistic(θ[IWREL]) : 1.0, presence_sd = PRESENCE ? exp(θ[IPRES]) : 1.0)
+            dry_release = WETREL ? logistic(θ[IWREL]) : 1.0, presence_sd = PRESENCE ? exp(θ[IPRES]) : 1.0,
+            ext_late = EXT2 ? exp(θ[IEXT]) : 1.0)
 end
 # the moisture factor on the force of infection ("humidity", "rain"; 1 otherwise)
 # (the series are looked up once, outside the closure: the dictionaries are untyped globals, and a
@@ -335,7 +341,8 @@ function simulate(q, treatment)
                       # myclobutanil also suppresses chasmothecium formation on treated leaves;
                       # the 2010 gate carries the 2010/11 winter factor (1 unless "winter")
                       gate = t -> t ≥ 240 ? (y == 2010 ? q.winter : 1.0) * spray(t) : 0.0, inoculations = inoc,
-                      tstops = [DAYS; treatment == "L" ? FUNGICIDE[y] : Float64[]])
+                      tstops = [DAYS; treatment == "L" ? FUNGICIDE[y] : Float64[]],
+                      external = y == 2009 ? 1.0 : q.ext_late)
     end
     # every score, profile and plot reads whole days only, which tstops hit exactly, so saving only
     # those leaves every value unchanged and is about twice as fast
@@ -434,7 +441,8 @@ logprior(θ, q) = -0.5 * (q.lag / 15)^2 - 0.5 * ((θ[7] - log(10.0)) / 0.7)^2 -
                  (EFFICACY ? 0.5 * ((θ[IEFF] - logit(0.9)) / 1.5)^2 : 0.0) -
                  (HUMID ? 0.5 * θ[IHUM]^2 : 0.0) - (RAIN ? 0.5 * (θ[IRAIN] / 1.5)^2 : 0.0) -
                  (WETREL ? 0.5 * (θ[IWREL] / 1.5)^2 : 0.0) -
-                 (PRESENCE ? 0.5 * (θ[IPRES] - log(0.5))^2 : 0.0)
+                 (PRESENCE ? 0.5 * (θ[IPRES] - log(0.5))^2 : 0.0) -
+                 (EXT2 ? 0.5 * (θ[IEXT] / 2)^2 : 0.0)
 
 # the Gaussian -log likelihood of the plot means (logit scale, sd q.sd) and, with "presence", of
 # the presence scores (cloglog scale, sd q.presence_sd); `constant` adds the 2π terms
@@ -499,6 +507,7 @@ HUMID && push!(θ0, 0.0)
 RAIN && push!(θ0, 0.0)
 WETREL && push!(θ0, logit(0.9))
 PRESENCE && push!(θ0, log(0.5))
+EXT2 && push!(θ0, 0.0)
 # a start for the added rates on the command line: julia ... outdir variant log_rate...
 length(ARGS) > 2 && (θ0[(end - length(ARGS) + 3):end] = parse.(Float64, ARGS[3:end]))
 @printf("variant %s: start %.3f\n", VARIANT, negloglik(θ0))
