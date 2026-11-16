@@ -67,6 +67,13 @@
 #   june2011  with "dates", both undated 2011 scores (oid3_11, oid4_11) no later than 20 June, when
 #           the third flush was noted: an assumption (there is no third-shoot score), to test the
 #           fits that move oid4_11 to late July.
+#   presence  also fits the early presence scores oid1_10 and oid1_11 (the share p of seedlings
+#           with any mildew; undated, before the first dated score): each year's day is profiled
+#           between leaf emergence (mean budburst score 1) and that score. The model's whole-seedling score v maps to presence
+#           through cloglog p = a + b log v, with a and b fixed by regressing cloglog(1 - zeros/n)
+#           on log(mean) over every 2009-2011 percent scoring (one link for all years and
+#           treatments). Residuals on the cloglog scale have their own sd (log-normal prior,
+#           median 0.5, log-sd 1), the regression's error included.
 #   A start for the added parameters (log scale) may follow the variant on the command line; the
 #   values replace the last entries of the start vector, so a full vector replaces all of it.
 #
@@ -92,7 +99,7 @@ const VARIANT = length(ARGS) ≥ 2 ? ARGS[2] : "base"
 const OPTIONS = Set(split(VARIANT, '+'))
 issubset(OPTIONS, Set(["base", "winter", "dates", "shed", "severity", "drought", "power", "late", "shoots", "sizes", "mean2010", "epsilon",
                        "tauprior", "spread", "efficacy", "humidity", "rain", "gap", "rain5", "rainlog",
-                       "wetrelease", "june2011"])) ||
+                       "wetrelease", "june2011", "presence"])) ||
     error("unknown variant: $VARIANT")
 const WINTER, UNDATED, SHED = "winter" in OPTIONS, "dates" in OPTIONS, "shed" in OPTIONS
 const SEVERITY, DROUGHT = "severity" in OPTIONS, "drought" in OPTIONS
@@ -126,6 +133,8 @@ const RAIN5, RAINLOG, WETREL = "rain5" in OPTIONS, "rainlog" in OPTIONS, "wetrel
 RAIN5 && RAINLOG && error("\"rain5\" and \"rainlog\" are alternatives; use one")
 const WET_MM = RAIN5 ? 5.0 : 1.0   # the wet-day threshold
 const IWREL = IRAIN + RAIN       # logit of the dry-day share of ascospore release
+const PRESENCE = "presence" in OPTIONS
+const IPRES = IWREL + WETREL     # log of the presence residuals' sd
 # with "gap", the profiled undated scores are at least GAP days from each other and from the dated
 # scores either side (whole days strictly between them otherwise, GAP = 1)
 const GAP = "gap" in OPTIONS ? 7 : 1
@@ -167,6 +176,24 @@ const shoot = [(year = parse(Int, r["year"]), column = String(r["column"]), pair
                 mean = parse(Float64, r["mean"]) / 100)
                for r in readcsv(joinpath(DATA, "plot_scores.csv")) if SHOOTS && haskey(SHOOT_COLUMNS, r["column"])]
 @assert length(shoot) == (SHOOTS ? 27 : 0)
+# early presence scores ("presence"): the share of seedlings with any mildew, continuity-corrected
+const presence = [(year = parse(Int, r["year"]), column = String(r["column"]), treatment = r["treatment"],
+                   plot = parse(Int, r["plot"]), p = clamp(parse(Float64, r["mean"]), 0.5 / parse(Int, r["n"]),
+                                                          1 - 0.5 / parse(Int, r["n"])))
+                  for r in readcsv(joinpath(DATA, "plot_scores.csv"))
+                  if PRESENCE && r["kind"] == "presence" && parse(Int, r["year"]) in YEARS]
+@assert length(presence) == (PRESENCE ? 18 : 0)
+cloglog(p) = log(-log1p(-p))
+# the presence link cloglog p = a + b log v: least squares over every 2009-2011 percent scoring
+# (whole seedling or one shoot) with 0 < p < 1, p = 1 - zeros/n and v the plot's mean score
+const PRESENCE_LINK = let pts = [(log(parse(Float64, r["mean"]) / 100), cloglog(1 - parse(Int, r["zeros"]) / parse(Int, r["n"])))
+                                 for r in readcsv(joinpath(DATA, "plot_scores.csv"))
+                                 if parse(Int, r["year"]) in YEARS && startswith(r["kind"], "percent") &&
+                                    0 < parse(Int, r["zeros"]) < parse(Int, r["n"]) && parse(Float64, r["mean"]) > 0]
+    x, y = first.(pts), last.(pts)
+    b = sum((x .- mean(x)) .* (y .- mean(y))) / sum(abs2, x .- mean(x))
+    (a = mean(y) - b * mean(x), b = b, n = length(pts))
+end
 weather_rows = readcsv(joinpath(DATA, "weather.csv"))
 temperature = Dict(y => DailySeries([parse(Float64, r["tmean"]) for r in weather_rows if r["year"] == string(y)])
                    for y in YEARS)
@@ -205,15 +232,19 @@ end
 # first flush when the mean budburst score crosses 2 (weekly scores from week 15, taken as
 # Wednesdays), second flushes noted 15 June 2010 and 24 May 2011, third 20 June 2011.
 phen = readcsv(joinpath(DATA, "plot_phenology.csv"))
-function score2_day(year)
+# the day the mean budburst score crosses `level`, interpolated between weekly scorings (the first
+# scoring day if it is already reached then)
+function score_day(year, level = 2)
     orders = sort(unique(parse(Int, r["order"]) for r in phen if r["year"] == string(year)))
     m = [mean(parse(Float64, r["mean"]) for r in phen if r["year"] == string(year) && r["order"] == string(k))
          for k in orders]
-    k = findfirst(≥(2), m)
-    frac = (2 - m[k - 1]) / (m[k] - m[k - 1])
+    k = findfirst(≥(level), m)
     wednesday15 = year == 2010 ? doy(2010, 4, 14) : doy(2011, 4, 13)
+    k == 1 && return Float64(wednesday15)
+    frac = (level - m[k - 1]) / (m[k] - m[k - 1])
     return wednesday15 + 7 * (orders[k - 1] - 1 + frac)
 end
+score2_day(year) = score_day(year, 2)
 const FLUSH = Dict(2009 => FlushProduction([145.0, 190.0], [10.0, 10.0], [0.6, 0.4]),
                    2010 => FlushProduction([score2_day(2010), 160.0, 200.0], [5.0, 8.0, 8.0], [0.5, 0.3, 0.2]),
                    2011 => FlushProduction([score2_day(2011), 140.0, 171.0], [5.0, 6.0, 8.0], [0.5, 0.3, 0.2]))
@@ -255,7 +286,8 @@ const NAMES = ["b_c", "b_ext", "c_w", "dose", "tau_s", "release_lag", "fungicide
                (POWER ? ["shed_power"] : String[])..., (SIZES ? ["later_2010", "later_2011"] : String[])...,
                (EPSILON ? ["epsilon"] : String[])..., (SPREAD ? ["cover0", "cover_rate"] : String[])...,
                (EFFICACY ? ["efficacy"] : String[])..., (HUMID ? ["humidity"] : String[])...,
-               (RAIN ? ["rain"] : String[])..., (WETREL ? ["dry_release"] : String[])...]
+               (RAIN ? ["rain"] : String[])..., (WETREL ? ["dry_release"] : String[])...,
+               (PRESENCE ? ["presence_sd"] : String[])...]
 function unpack(θ)
     return (b_c = exp(θ[1]), b_ext = exp(θ[2]), c_w = exp(θ[3]), efficacy = EFFICACY ? logistic(θ[IEFF]) : 1.0,
             dose = exp(θ[4]),
@@ -267,7 +299,7 @@ function unpack(θ)
             epsilon = EPSILON ? logistic(θ[IEPS]) : 0.05,
             cover0 = SPREAD ? logistic(θ[ISPREAD]) : 1.0, cover_rate = SPREAD ? exp(θ[ISPREAD + 1]) : 0.0,
             humid = HUMID ? θ[IHUM] : 0.0, rain = RAIN ? θ[IRAIN] : 0.0,
-            dry_release = WETREL ? logistic(θ[IWREL]) : 1.0)
+            dry_release = WETREL ? logistic(θ[IWREL]) : 1.0, presence_sd = PRESENCE ? exp(θ[IPRES]) : 1.0)
 end
 # the moisture factor on the force of infection ("humidity", "rain"; 1 otherwise)
 # (the series are looked up once, outside the closure: the dictionaries are untyped globals, and a
@@ -367,7 +399,21 @@ function fitted(q)
             end
         end
     end
-    return (; pred, r, dates, sols)
+    # presence scores: each year's day profiled between leaf emergence (mean budburst score 1) and
+    # the first dated score
+    rp = Float64[]
+    for y in YEARS
+        ps = [o for o in presence if o.year == y]
+        isempty(ps) && continue
+        days = ceil(Int, score_day(y, 1)):(WINDOW[y][1] - GAP)
+        link = Dict(t => [PRESENCE_LINK.a + PRESENCE_LINK.b * log(max(severity(sols[t], y - 2008, Float64(d), q), 1e-12))
+                          for d in days] for t in ("L", "M", "H"))
+        s = [sum(abs2(cloglog(o.p) - link[o.treatment][i]) for o in ps) for i in eachindex(days)]
+        i = argmin(s)
+        dates[first(ps).column] = days[i]
+        append!(rp, [cloglog(o.p) - link[o.treatment][i] for o in ps])
+    end
+    return (; pred, r, rp, dates, sols)
 end
 
 # weak priors keep the optimiser in a sensible region; release near budburst (Marçais et al. 2009)
@@ -387,17 +433,26 @@ logprior(θ, q) = -0.5 * (q.lag / 15)^2 - 0.5 * ((θ[7] - log(10.0)) / 0.7)^2 -
                  (SPREAD ? 0.5 * ((θ[ISPREAD] - logit(0.3)) / 1.5)^2 + 0.5 * ((θ[ISPREAD + 1] - log(0.03)) / 1.5)^2 : 0.0) -
                  (EFFICACY ? 0.5 * ((θ[IEFF] - logit(0.9)) / 1.5)^2 : 0.0) -
                  (HUMID ? 0.5 * θ[IHUM]^2 : 0.0) - (RAIN ? 0.5 * (θ[IRAIN] / 1.5)^2 : 0.0) -
-                 (WETREL ? 0.5 * (θ[IWREL] / 1.5)^2 : 0.0)
+                 (WETREL ? 0.5 * (θ[IWREL] / 1.5)^2 : 0.0) -
+                 (PRESENCE ? 0.5 * (θ[IPRES] - log(0.5))^2 : 0.0)
+
+# the Gaussian -log likelihood of the plot means (logit scale, sd q.sd) and, with "presence", of
+# the presence scores (cloglog scale, sd q.presence_sd); `constant` adds the 2π terms
+gauss(r, sd) = length(r) * log(sd) + sum(abs2, r; init = 0.0) / (2sd^2)
+function data_nll(fr, q; constant = false)
+    n = length(fr.r) + length(fr.rp)
+    return gauss(fr.r, q.sd) + gauss(fr.rp, q.presence_sd) + (constant ? n / 2 * log(2π) : 0.0)
+end
 
 function negloglik(θ)
     q = unpack(θ)
-    r = try
-        fitted(q).r
+    fr = try
+        fitted(q)
     catch err
         err isa PowderyMildewError || rethrow()
         return Inf
     end
-    return length(r) * log(q.sd) + sum(abs2, r) / (2q.sd^2) - logprior(θ, q)
+    return data_nll(fr, q) - logprior(θ, q)
 end
 
 println("budburst (score 2) days: ", join((@sprintf("%d %.1f", y, BUDBURST[y]) for y in YEARS), ", "))
@@ -443,6 +498,7 @@ EFFICACY && push!(θ0, logit(0.9))
 HUMID && push!(θ0, 0.0)
 RAIN && push!(θ0, 0.0)
 WETREL && push!(θ0, logit(0.9))
+PRESENCE && push!(θ0, log(0.5))
 # a start for the added rates on the command line: julia ... outdir variant log_rate...
 length(ARGS) > 2 && (θ0[(end - length(ARGS) + 3):end] = parse.(Float64, ARGS[3:end]))
 @printf("variant %s: start %.3f\n", VARIANT, negloglik(θ0))
@@ -497,11 +553,13 @@ end
 # the likelihood without the priors, for comparing variants whose priors differ ("tauprior"),
 # and information criteria with the Gaussian constant (the profiled days of the undated scores,
 # the same in every variant with "dates", are not counted)
-nobs, npar = length(fit.r), length(θ̂)
-nll = nobs * log(q̂.sd) + sum(abs2, fit.r) / (2q̂.sd^2) + nobs / 2 * log(2π)
+nobs, npar = length(fit.r) + length(fit.rp), length(θ̂)
+nll = data_nll(fit, q̂; constant = true)
 open(joinpath(OUT, "fit.txt"), "w") do io
     for out in (stdout, io)
-        @printf(out, "variant %s: %d plot means\n", VARIANT, length(fit.r))
+        @printf(out, "variant %s: %d plot means%s\n", VARIANT, length(fit.r),
+                PRESENCE ? @sprintf(" and %d presence scores (link cloglog p = %.3f + %.3f log v, from %d scorings)",
+                                    length(fit.rp), PRESENCE_LINK.a, PRESENCE_LINK.b, PRESENCE_LINK.n) : "")
         @printf(out, "objective %.4f; Hessian eigenvalues %.3g to %.3g\n", Optim.minimum(res), extrema(eigvals(Symmetric(H)))...)
         @printf(out, "-log likelihood %.4f (with the Gaussian constant), -log prior %.4f; %d parameters, AIC %.2f, BIC %.2f\n",
                 nll, -logprior(θ̂, q̂), npar, 2nll + 2npar, 2nll + npar * log(nobs))
@@ -533,6 +591,19 @@ open(joinpath(OUT, "fit.txt"), "w") do io
                         join((@sprintf("%5.1f", 100undated[i].mean) for i in idx), " "),
                         100severity(sols[t], y - 2008, Float64(d), q̂), c, Date(y) + Day(d - 1),
                         c in REPLACED ? " (not fitted: replaced by its shoot scores)" : "")
+            end
+        end
+        if PRESENCE
+            println(out, "\npresence scores at their profiled days (share of seedlings with mildew, %; model through the link)")
+            for y in YEARS, t in ("L", "M", "H")
+                ps = [o for o in presence if o.year == y && o.treatment == t]
+                isempty(ps) && continue
+                d = fit.dates[first(ps).column]
+                v = severity(sols[t], y - 2008, Float64(d), q̂)
+                @printf(out, "%d %3d  %s   %-30s %6.1f   %s, %s (model score %.3f %%)\n", y, d, t,
+                        join((@sprintf("%5.1f", 100o.p) for o in ps), " "),
+                        100(1 - exp(-exp(PRESENCE_LINK.a + PRESENCE_LINK.b * log(max(v, 1e-12))))),
+                        first(ps).column, Date(y) + Day(d - 1), 100v)
             end
         end
         if SHOOTS
