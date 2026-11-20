@@ -52,6 +52,11 @@
 #   humidity  the force of infection times exp(-h (RH - 70)/10), RH the day's mean relative
 #           humidity (%): h > 0 if dry air favours infection, h < 0 if humid air does; h normal,
 #           prior mean 0, sd 1 (a factor of e per 10 points of RH at one sd).
+#   humsummer  with "humidity", the factor applies from 1 June (day 152) only, 1 before: a
+#           humidity effect on the summer epidemic but not on spring infection (fit 25: fitted
+#           without 2011, h of -2 had no 2011 epidemic after the dry spring).
+#   humcap  with "humidity", RH clamped to 60-80 % in the factor, so it lies within exp(+-h): no
+#           single humid or dry day weighs more than one at 80 or 60 %.
 #   rain    the force of infection times exp(-r) on wet days (precipitation >= 1 mm): r > 0 if rain
 #           suppresses infection (conidia washed off or burst); r normal, prior mean 0, sd 1.5.
 #   rain5   with "rain", a wet day needs at least 5 mm (also for "wetrelease").
@@ -77,6 +82,43 @@
 #   ext2    the outside force of infection in 2010-11 is b_ext times a fitted ratio (the season's
 #           `external` multiplier; 2009, when the seedlings were newly sown with no local
 #           inoculum, keeps b_ext): log-normal prior, median 1, log-sd 2.
+#   effyear the fungicide's efficacy fitted separately for each year (three logits, each with the
+#           "efficacy" prior), for spraying that protected better in some years. Not with "efficacy".
+#   decayyear  the fungicide's residual activity (`fungicide_decay`) in 2010 and 2011 is 2009's times
+#           a fitted ratio (log-normal priors, median 1, log-sd 1).
+#   hold2009, hold2010, hold2011  leave that year's scores (plot means, undated, shoot and
+#           presence) out of the fit and report how well the fitted model predicts them: the
+#           Gaussian -log density of the held-out residuals at the fitted sds. Every year is still
+#           simulated (each season's inoculum comes from the one before), and the held-out
+#           undated scores are still put at their best days.
+#   fix_<name>=<value>  holds a parameter (a name from the fit.txt table) at a value on the
+#           unconstrained scale (log, logit or identity, as in the printed optimum), e.g.
+#           fix_humidity=-0.4, for profile likelihoods; it is not counted as a parameter.
+#   cluster the plot-mean residuals of one year and treatment (nine cells) share a normal offset
+#           of sd tau (`cluster_sd`; log-normal prior, median 0.3, log-sd 1.5) on top of their own
+#           errors (obs_sd, now the within-cell sd), integrated out exactly. Misfits come in blocks
+#           (L autumn 2010, M and H autumn 2009), so independent errors overstate the evidence
+#           and held-out predictions' confidence. The undated days are profiled on squared
+#           residuals, or with "lm" on the clustered likelihood.
+#   plotyear  like "cluster", but the residuals of one plot in one year share the offset (27 groups,
+#           4-6 scores each): a plot that runs high or low all season. `plot_sd`, same prior.
+#   plot    the residuals of one plot share an offset in every year (9 groups): a persistent plot
+#           (or block) effect. The held-out density is then conditional on the plot's fitted
+#           years, the predictive density for a new year. One grouping at a time.
+#   yearsd  each year's plot means have their own noise sd, obs_sd e^δ with δ ~ N(0, s²) (`year_sd`
+#           = s; log-normal prior, median 0.3, log-sd 1.5), integrated out exactly per year
+#           (adaptive Gauss-Hermite), so obs_sd is the median year's sd. A held-out year's density
+#           integrates over its unknown sd. Presence scores keep their own sd. Not with a
+#           grouping; the profiled days are unchanged (a year's term rises with its squared residuals).
+#   lm      a numerical option, not a model: the seasons are integrated with Vern9 at tolerances
+#           1e-14/1e-11 (the default Tsit5 at 1e-9/1e-7 leaves noise of about 1e-3 in the
+#           objective, from the tiny early-season states on the logit scale, which no simplex can
+#           converge on), and the objective is minimised by Levenberg-Marquardt on the residuals
+#           with a finite-difference Jacobian, from the start and from LM_STARTS - 1 jittered
+#           starts (environment variable, default 3). The noise sds are optimised in closed
+#           form given the residuals, the profiled days are refreshed at every trial point, and
+#           the Hessian is taken with the days held at their optimum. Objectives differ from
+#           the default path's by about 1e-2 (its integration error).
 #   A start for the added parameters (log scale) may follow the variant on the command line; the
 #   values replace the last entries of the start vector, so a full vector replaces all of it.
 #
@@ -93,16 +135,18 @@ using Plots
 using Printf
 using Statistics
 using Dates: Date, Day, dayofyear
-using LinearAlgebra: Symmetric, inv, diag, eigvals
+using LinearAlgebra: Symmetric, inv, diag, eigvals, Diagonal, norm, eigen, SymTridiagonal
+using Random: MersenneTwister
 
 const DATA = joinpath(@__DIR__, "..", "data", "pierroton")
 const OUT = length(ARGS) ≥ 1 ? ARGS[1] : joinpath(@__DIR__, "..", "runs", "pierroton_fit")
 mkpath(OUT)
 const VARIANT = length(ARGS) ≥ 2 ? ARGS[2] : "base"
 const OPTIONS = Set(split(VARIANT, '+'))
-issubset(OPTIONS, Set(["base", "winter", "dates", "shed", "severity", "drought", "power", "late", "shoots", "sizes", "mean2010", "epsilon",
+issubset(filter(!startswith("fix_"), OPTIONS), Set(["base", "winter", "dates", "shed", "severity", "drought", "power", "late", "shoots", "sizes", "mean2010", "epsilon",
                        "tauprior", "spread", "efficacy", "humidity", "rain", "gap", "rain5", "rainlog",
-                       "wetrelease", "june2011", "presence", "ext2"])) ||
+                       "wetrelease", "june2011", "presence", "ext2", "effyear", "decayyear",
+                       "hold2009", "hold2010", "hold2011", "humsummer", "humcap", "cluster", "plotyear", "plot", "yearsd", "lm"])) ||
     error("unknown variant: $VARIANT")
 const WINTER, UNDATED, SHED = "winter" in OPTIONS, "dates" in OPTIONS, "shed" in OPTIONS
 const SEVERITY, DROUGHT = "severity" in OPTIONS, "drought" in OPTIONS
@@ -131,6 +175,8 @@ const IEFF = ISPREAD + 2SPREAD  # logit of the fungicide's efficacy
 const HUMID, RAIN = "humidity" in OPTIONS, "rain" in OPTIONS
 const IHUM = IEFF + EFFICACY    # humidity coefficient h, then the wet-day coefficient r
 const IRAIN = IHUM + HUMID
+const HUMSUMMER, HUMCAP = "humsummer" in OPTIONS, "humcap" in OPTIONS
+(HUMSUMMER || HUMCAP) && !HUMID && error("\"humsummer\" and \"humcap\" need \"humidity\"")
 const RAIN5, RAINLOG, WETREL = "rain5" in OPTIONS, "rainlog" in OPTIONS, "wetrelease" in OPTIONS
 (RAIN5 || RAINLOG) && !RAIN && error("\"rain5\" and \"rainlog\" need \"rain\"")
 RAIN5 && RAINLOG && error("\"rain5\" and \"rainlog\" are alternatives; use one")
@@ -140,6 +186,26 @@ const PRESENCE = "presence" in OPTIONS
 const IPRES = IWREL + WETREL     # log of the presence residuals' sd
 const EXT2 = "ext2" in OPTIONS
 const IEXT = IPRES + PRESENCE    # log of the 2010-11 outside input relative to 2009's
+const EFFYEAR, DECAYYEAR = "effyear" in OPTIONS, "decayyear" in OPTIONS
+EFFYEAR && EFFICACY && error("\"effyear\" and \"efficacy\" both set the efficacy; use one")
+const IEFFY = IEXT + EXT2        # logits of the 2009, 2010 and 2011 efficacies
+const IDECY = IEFFY + 3EFFYEAR   # logs of the 2010 and 2011 decay relative to 2009's
+const CLUSTER = "cluster" in OPTIONS
+const PLOTYEAR, PLOTRE = "plotyear" in OPTIONS, "plot" in OPTIONS
+CLUSTER + PLOTYEAR + PLOTRE ≤ 1 || error("\"cluster\", \"plotyear\" and \"plot\" are alternatives; use one")
+const GROUPED = CLUSTER || PLOTYEAR || PLOTRE   # residuals share normal offsets within groups
+# a residual's group: year and treatment, plot and year, or plot
+group_key(y, t, plot) = CLUSTER ? (y, t) : PLOTYEAR ? (y, string(plot)) : (0, string(plot))
+const LM = "lm" in OPTIONS       # tight integration and Levenberg-Marquardt (numerical only)
+const ICLU = IDECY + 2DECAYYEAR  # log of the group offsets' sd (year by treatment, or plot)
+const YEARSD = "yearsd" in OPTIONS
+YEARSD && GROUPED && error("\"yearsd\" is not combined with a grouping")
+const IYSD = ICLU + GROUPED      # log of the sd of log(each year's noise sd)
+# the held-out year (0: none)
+const HOLD = let h = [y for y in 2009:2011 if "hold$y" in OPTIONS]
+    length(h) ≤ 1 || error("hold out one year at a time")
+    isempty(h) ? 0 : only(h)
+end
 # with "gap", the profiled undated scores are at least GAP days from each other and from the dated
 # scores either side (whole days strictly between them otherwise, GAP = 1)
 const GAP = "gap" in OPTIONS ? 7 : 1
@@ -292,7 +358,27 @@ const NAMES = ["b_c", "b_ext", "c_w", "dose", "tau_s", "release_lag", "fungicide
                (EPSILON ? ["epsilon"] : String[])..., (SPREAD ? ["cover0", "cover_rate"] : String[])...,
                (EFFICACY ? ["efficacy"] : String[])..., (HUMID ? ["humidity"] : String[])...,
                (RAIN ? ["rain"] : String[])..., (WETREL ? ["dry_release"] : String[])...,
-               (PRESENCE ? ["presence_sd"] : String[])..., (EXT2 ? ["ext_2010_11"] : String[])...]
+               (PRESENCE ? ["presence_sd"] : String[])..., (EXT2 ? ["ext_2010_11"] : String[])...,
+               (EFFYEAR ? ["efficacy_2009", "efficacy_2010", "efficacy_2011"] : String[])...,
+               (DECAYYEAR ? ["decay_ratio_2010", "decay_ratio_2011"] : String[])...,
+               (CLUSTER ? ["cluster_sd"] : String[])..., (PLOTYEAR || PLOTRE ? ["plot_sd"] : String[])...,
+               (YEARSD ? ["year_sd"] : String[])...]
+# "fix_<name>=<value>": the held parameters' positions in θ and values; the rest are optimised
+const FIXED = Dict(begin
+                       name, value = split(o[5:end], '=')
+                       k = findfirst(==(name), NAMES)
+                       k === nothing && error("fix: no parameter $name in this variant")
+                       k => parse(Float64, value)
+                   end for o in OPTIONS if startswith(o, "fix_"))
+const FREE = [k for k in eachindex(NAMES) if !haskey(FIXED, k)]
+function expand(φ)
+    θ = zeros(eltype(φ), length(NAMES))
+    θ[FREE] = φ
+    for (k, v) in FIXED
+        θ[k] = v
+    end
+    return θ
+end
 function unpack(θ)
     return (b_c = exp(θ[1]), b_ext = exp(θ[2]), c_w = exp(θ[3]), efficacy = EFFICACY ? logistic(θ[IEFF]) : 1.0,
             dose = exp(θ[4]),
@@ -305,7 +391,10 @@ function unpack(θ)
             cover0 = SPREAD ? logistic(θ[ISPREAD]) : 1.0, cover_rate = SPREAD ? exp(θ[ISPREAD + 1]) : 0.0,
             humid = HUMID ? θ[IHUM] : 0.0, rain = RAIN ? θ[IRAIN] : 0.0,
             dry_release = WETREL ? logistic(θ[IWREL]) : 1.0, presence_sd = PRESENCE ? exp(θ[IPRES]) : 1.0,
-            ext_late = EXT2 ? exp(θ[IEXT]) : 1.0)
+            ext_late = EXT2 ? exp(θ[IEXT]) : 1.0,
+            eff_year = EFFYEAR ? logistic.(θ[IEFFY:(IEFFY + 2)]) : nothing,
+            decay_ratio = DECAYYEAR ? [1.0; exp.(θ[IDECY:(IDECY + 1)])] : [1.0, 1.0, 1.0],
+            cluster = GROUPED ? exp(θ[ICLU]) : 0.0, year_sd = YEARSD ? exp(θ[IYSD]) : 0.0)
 end
 # the moisture factor on the force of infection ("humidity", "rain"; 1 otherwise)
 # (the series are looked up once, outside the closure: the dictionaries are untyped globals, and a
@@ -313,7 +402,13 @@ end
 function moisture(q, y)
     (HUMID || RAIN) || return t -> 1.0
     RH, W, h, r = rel_humidity[y], rain_cov[y], q.humid, q.rain
-    return t -> exp(-h * (RH(t) - 70) / 10 - r * W(t))
+    # "humsummer": from 1 June (a whole day, so a tstop); "humcap": RH within 60-80 %. Without
+    # them the arithmetic is exactly fit 18's, so earlier fits reproduce to the last digit
+    from = HUMSUMMER ? 152.0 : -Inf
+    return t -> begin
+        x = HUMCAP ? clamp(RH(t), 60.0, 80.0) : RH(t)
+        t ≥ from ? exp(-h * (x - 70) / 10 - r * W(t)) : exp(-r * W(t))
+    end
 end
 # the wet gate on ascospore release ("wetrelease"): w on dry days, 1 on wet days
 function release_gate(q, y)
@@ -331,7 +426,8 @@ function simulate(q, treatment)
     forcings = map(YEARS) do y
         T = temperature[y]
         release = ReleaseHazard(; rate = 0.2, optimum = BUDBURST[y] + q.lag, curvature = -0.003, wet = release_gate(q, y))
-        spray = treatment == "L" ? FungicideSchedule(FUNGICIDE[y]; efficacy = q.efficacy, decay = q.decay) : t -> 1.0
+        spray = treatment == "L" ? FungicideSchedule(FUNGICIDE[y]; efficacy = EFFYEAR ? q.eff_year[y - 2008] : q.efficacy,
+                                                     decay = q.decay * q.decay_ratio[y - 2008]) : t -> 1.0
         inoc = treatment == "H" ? [(d, q.dose) for d in INOCULATION[y]] : Tuple{Float64,Float64}[]
         wet = moisture(q, y)
         SeasonForcing(; tspan = TSPAN, production = TWO ? cohorts_of(flushes(q, y)) : flushes(q, y), release,
@@ -346,7 +442,9 @@ function simulate(q, treatment)
     end
     # every score, profile and plot reads whole days only, which tstops hit exactly, so saving only
     # those leaves every value unchanged and is about twice as fast
-    return solve(MildewProblem(p, collect(forcings), 0.0); abstol = 1e-9, reltol = 1e-7, saveat = SAVEDAYS, dense = false)
+    prob = MildewProblem(p, collect(forcings), 0.0)
+    LM && return solve(prob; alg = PowderyMildew.Vern9(), abstol = 1e-14, reltol = 1e-11, saveat = SAVEDAYS, dense = false)
+    return solve(prob; abstol = 1e-9, reltol = 1e-7, saveat = SAVEDAYS, dense = false)
 end
 
 logit(x) = log(x / (1 - x))
@@ -368,12 +466,18 @@ lg(x) = logit(clamp(x, 1e-4, 1 - 1e-4))
 # Model predictions and logit residuals. With "dates", each year's pair of undated scores is put
 # at the ordered pair of whole days strictly between the dated scores that minimises their
 # squared residuals: the profile over the dates, since nothing else in the objective depends on
-# them.
-function fitted(q)
+# them. `pinned` (a column => day table, as returned in `dates`) holds the days instead.
+function fitted(q; pinned = nothing)
     sols = Dict(t => simulate(q, t) for t in ("L", "M", "H"))
     pred = [severity(sols[o.treatment], o.year - 2008, Float64(o.day), q) for o in obs]
     r = [lg(o.mean) - lg(m) for (o, m) in zip(obs, pred)]
+    ry = [o.year for o in obs]   # each residual's year, for "hold<year>"
+    rt = [o.treatment for o in obs]   # and treatment, for "cluster"
+    rk = [o.plot for o in obs]        # and plot, for "plotyear" and "plot"
     dates = Dict{String,Int}()
+    # each year's undated candidates, for the grouped day search: the days, the feasible first and
+    # second days, and per residual its position in r, column (1 or 2) and values on every day
+    cand = Dict{Int,Any}()
     if UNDATED
         for y in YEARS
             days = (WINDOW[y][1] + GAP):(WINDOW[y][2] - GAP)
@@ -397,18 +501,79 @@ function fitted(q)
                 s1[j - GAP] < low && ((low, at) = (s1[j - GAP], j - GAP))
                 low + s2[j] < best && ((best, i1, i2) = (low + s2[j], at, j))
             end
+            pinned === nothing ||((i1, i2) = (findfirst(==(pinned[c1]), days), findfirst(==(pinned[c2]), days)))
             dates[c1], dates[c2] = days[i1], days[i2]
+            entries = []
             for o in undated
-                o.year == y && !(o.column in REPLACED) && push!(r, lg(o.mean) - curve[o.treatment][o.column == c1 ? i1 : i2])
+                if o.year == y && !(o.column in REPLACED)
+                    push!(r, lg(o.mean) - curve[o.treatment][o.column == c1 ? i1 : i2])
+                    push!(rt, o.treatment)
+                    push!(rk, o.plot)
+                    push!(entries, (pos = length(r), col = o.column == c1 ? 1 : 2, v = lg(o.mean) .- curve[o.treatment]))
+                end
             end
             for o in ys
                 push!(r, lg(o.mean) - cc[(o.treatment, o.cohort)][o.paired == c1 ? i1 : i2])
+                push!(rt, o.treatment)
+                push!(rk, o.plot)
+                push!(entries, (pos = length(r), col = o.paired == c1 ? 1 : 2, v = lg(o.mean) .- cc[(o.treatment, o.cohort)]))
+            end
+            append!(ry, fill(y, length(r) - length(ry)))
+            cand[y] = (; days, c1, c2, ok1 = isfinite.(s1), ok2 = isfinite.(s2), entries)
+        end
+    end
+    rg = [group_key(ry[i], rt[i], rk[i]) for i in eachindex(r)]
+    # Grouped errors with "lm": each year's pair of days minimises the grouped -log likelihood
+    # instead of the squared residuals, so that the profiled objective is the one being minimised
+    # (the squared-residual pair makes it jump where the two disagree, which stalls the
+    # optimiser). Each group's quadratic form is Q/(2σ²) - τ²S²/(2σ²(σ² + nτ²)), S and Q the sum
+    # and sum of squares of its residuals; residuals of the held-out year count only in its own
+    # search (its predictive density, given the fitted years). A persistent plot effect couples
+    # the years, so the years are swept three times.
+    if UNDATED && GROUPED && LM && pinned === nothing
+        σ2, τ2 = q.sd^2, q.cluster^2
+        for _ in 1:(PLOTRE ? 3 : 1), y in YEARS
+            C = cand[y]
+            mine = falses(length(r))
+            foreach(e -> mine[e.pos] = true, C.entries)
+            base = Dict{Any,Vector{Float64}}()   # group => [S, Q, n] of the other residuals
+            for i in eachindex(r)
+                (mine[i] || (y != HOLD && ry[i] == HOLD)) && continue
+                b = get!(base, rg[i], zeros(3))
+                b .+= (r[i], r[i]^2, 1.0)
+            end
+            gs = unique(rg[e.pos] for e in C.entries)
+            nd = length(C.days)
+            st = Dict((g, c) => (zeros(nd), zeros(nd), 0) for g in gs, c in 1:2)
+            for e in C.entries
+                S, Q, n = st[(rg[e.pos], e.col)]
+                S .+= e.v
+                Q .+= e.v .^ 2
+                st[(rg[e.pos], e.col)] = (S, Q, n + 1)
+            end
+            best, i1, i2 = Inf, 0, 0
+            for j in (1 + GAP):nd, i in 1:(j - GAP)
+                (C.ok1[i] && C.ok2[j]) || continue
+                f = 0.0
+                for g in gs
+                    b = get(base, g, zeros(3))
+                    a1, a2 = st[(g, 1)], st[(g, 2)]
+                    S = b[1] + a1[1][i] + a2[1][j]
+                    Q = b[2] + a1[2][i] + a2[2][j]
+                    n = b[3] + a1[3] + a2[3]
+                    f += Q / (2σ2) - τ2 * S^2 / (2σ2 * (σ2 + n * τ2))
+                end
+                f < best && ((best, i1, i2) = (f, i, j))
+            end
+            dates[C.c1], dates[C.c2] = C.days[i1], C.days[i2]
+            for e in C.entries
+                r[e.pos] = e.v[e.col == 1 ? i1 : i2]
             end
         end
     end
     # presence scores: each year's day profiled between leaf emergence (mean budburst score 1) and
     # the first dated score
-    rp = Float64[]
+    rp, rpy = Float64[], Int[]
     for y in YEARS
         ps = [o for o in presence if o.year == y]
         isempty(ps) && continue
@@ -416,11 +581,12 @@ function fitted(q)
         link = Dict(t => [PRESENCE_LINK.a + PRESENCE_LINK.b * log(max(severity(sols[t], y - 2008, Float64(d), q), 1e-12))
                           for d in days] for t in ("L", "M", "H"))
         s = [sum(abs2(cloglog(o.p) - link[o.treatment][i]) for o in ps) for i in eachindex(days)]
-        i = argmin(s)
+        i = pinned === nothing ? argmin(s) : findfirst(==(pinned[first(ps).column]), days)
         dates[first(ps).column] = days[i]
         append!(rp, [cloglog(o.p) - link[o.treatment][i] for o in ps])
+        append!(rpy, fill(y, length(ps)))
     end
-    return (; pred, r, rp, dates, sols)
+    return (; pred, r, rp, ry, rt, rk, rg, rpy, dates, sols)
 end
 
 # weak priors keep the optimiser in a sensible region; release near budburst (Marçais et al. 2009)
@@ -442,14 +608,71 @@ logprior(θ, q) = -0.5 * (q.lag / 15)^2 - 0.5 * ((θ[7] - log(10.0)) / 0.7)^2 -
                  (HUMID ? 0.5 * θ[IHUM]^2 : 0.0) - (RAIN ? 0.5 * (θ[IRAIN] / 1.5)^2 : 0.0) -
                  (WETREL ? 0.5 * (θ[IWREL] / 1.5)^2 : 0.0) -
                  (PRESENCE ? 0.5 * (θ[IPRES] - log(0.5))^2 : 0.0) -
-                 (EXT2 ? 0.5 * (θ[IEXT] / 2)^2 : 0.0)
+                 (EXT2 ? 0.5 * (θ[IEXT] / 2)^2 : 0.0) -
+                 (EFFYEAR ? 0.5 * sum(abs2, (θ[IEFFY:(IEFFY + 2)] .- logit(0.9)) ./ 1.5) : 0.0) -
+                 (DECAYYEAR ? 0.5 * sum(abs2, θ[IDECY:(IDECY + 1)]) : 0.0) -
+                 (GROUPED ? 0.5 * ((θ[ICLU] - log(0.3)) / 1.5)^2 : 0.0) -
+                 (YEARSD ? 0.5 * ((θ[IYSD] - log(0.3)) / 1.5)^2 : 0.0)
 
 # the Gaussian -log likelihood of the plot means (logit scale, sd q.sd) and, with "presence", of
-# the presence scores (cloglog scale, sd q.presence_sd); `constant` adds the 2π terms
+# the presence scores (cloglog scale, sd q.presence_sd); `constant` adds the 2π terms. Only the
+# fitted years count ("hold<year>" leaves one out); `held = true` gives the held-out year's instead.
 gauss(r, sd) = length(r) * log(sd) + sum(abs2, r; init = 0.0) / (2sd^2)
-function data_nll(fr, q; constant = false)
-    n = length(fr.r) + length(fr.rp)
-    return gauss(fr.r, q.sd) + gauss(fr.rp, q.presence_sd) + (constant ? n / 2 * log(2π) : 0.0)
+# "cluster": the residuals of one year and treatment share a normal offset of sd τ on top of
+# their own error of sd σ (covariance σ²I + τ²11ᵀ), integrated out exactly: gauss when τ = 0
+function cell_nll(r, σ, τ)
+    n, v = length(r), σ^2 + length(r) * τ^2
+    return (n - 1) * log(σ) + log(v) / 2 + (sum(abs2, r; init = 0.0) - τ^2 / v * sum(r; init = 0.0)^2) / (2σ^2)
+end
+# "yearsd": one year's plot-mean residuals r with sd σ e^δ, δ ~ N(0, s²) integrated out:
+# -log ∫ N(δ; 0, s²) Π N(r_i; 0, σ² e^{2δ}) dδ without the 2π of the residuals (as gauss), by
+# Gauss-Hermite around the integrand's mode (log-concave in δ; Newton converges). Also returns
+# w = E[e^{-2δ} | r], the weight that makes r √w / σ whiten the gradient exactly, and the mode δ.
+# As s → 0 it is gauss(r, σ).
+const GH = let m = 30, E = eigen(SymTridiagonal(zeros(m), sqrt.((1:(m - 1)) ./ 2)))   # Golub-Welsch
+    (x = E.values, w = sqrt(π) .* E.vectors[1, :] .^ 2)
+end
+function year_nll(r, σ, s)
+    n, S = length(r), sum(abs2, r; init = 0.0)
+    n == 0 && return (nll = 0.0, w = 1.0, δ = 0.0)
+    g(δ) = n * (log(σ) + δ) + S * exp(-2δ) / (2σ^2) + δ^2 / (2s^2)
+    δ = 0.0
+    for _ in 1:500
+        a = S * exp(-2δ) / σ^2
+        step = (n - a + δ / s^2) / (2a + 1 / s^2)
+        δ -= step
+        abs(step) < 1e-13 && break
+    end
+    c = sqrt(2 / (2S * exp(-2δ) / σ^2 + 1 / s^2))
+    l = [log(wk) + xk^2 - g(δ + c * xk) for (xk, wk) in zip(GH.x, GH.w)]
+    m = maximum(l)
+    p = exp.(l .- m)
+    nll = log(s * sqrt(2π)) - log(c) - m - log(sum(p))
+    w = sum(p .* exp.(-2 .* (δ .+ c .* GH.x))) / sum(p)
+    return (; nll, w, δ)
+end
+# With grouped errors, the held-out year's density is conditional on the fitted years' residuals
+# in the same groups (joint minus fitted): the predictive density. For year-local groups
+# ("cluster", "plotyear") the fitted part is empty and it is the held-out residuals' own density.
+function data_nll(fr, q; constant = false, held = false)
+    keep(ys) = held ? ys .== HOLD : ys .!= HOLD
+    k = keep(fr.ry)
+    r, rp = fr.r[k], fr.rp[keep(fr.rpy)]
+    n = length(r) + length(rp)
+    means = if GROUPED && held
+        fitd = fr.ry .!= HOLD
+        sum(cell_nll(fr.r[fr.rg .== Ref(g)], q.sd, q.cluster) - cell_nll(fr.r[(fr.rg .== Ref(g)) .& fitd], q.sd, q.cluster)
+            for g in unique(fr.rg[k]); init = 0.0)
+    elseif GROUPED
+        rg = fr.rg[k]
+        sum(cell_nll(r[rg .== Ref(g)], q.sd, q.cluster) for g in unique(rg); init = 0.0)
+    elseif YEARSD   # years are independent given σ and s, so a held-out year's term is its own
+        ry = fr.ry[k]
+        sum(year_nll(r[ry .== y], q.sd, q.year_sd).nll for y in unique(ry); init = 0.0)
+    else
+        gauss(r, q.sd)
+    end
+    return means + gauss(rp, q.presence_sd) + (constant ? n / 2 * log(2π) : 0.0)
 end
 
 function negloglik(θ)
@@ -508,33 +731,80 @@ RAIN && push!(θ0, 0.0)
 WETREL && push!(θ0, logit(0.9))
 PRESENCE && push!(θ0, log(0.5))
 EXT2 && push!(θ0, 0.0)
+EFFYEAR && push!(θ0, logit(0.95), logit(0.95), logit(0.95))
+DECAYYEAR && push!(θ0, 0.0, 0.0)
+GROUPED && push!(θ0, log(0.3))
+YEARSD && push!(θ0, log(0.3))
 # a start for the added rates on the command line: julia ... outdir variant log_rate...
 length(ARGS) > 2 && (θ0[(end - length(ARGS) + 3):end] = parse.(Float64, ARGS[3:end]))
+for (k, v) in FIXED
+    θ0[k] = v
+end
 @printf("variant %s: start %.3f\n", VARIANT, negloglik(θ0))
 flush(stdout)
+# the objective over the free parameters ("fix_" holds the others)
+objective(φ) = negloglik(expand(φ))
 # Nelder-Mead from three starts, each restarted from its own optimum until it stops improving
 function minimise(start)
-    res = optimize(negloglik, start, NelderMead(), Optim.Options(; iterations = 3000, f_reltol = 1e-10))
+    res = optimize(objective, start[FREE], NelderMead(), Optim.Options(; iterations = 3000, f_reltol = 1e-10))
     for _ in 1:6
-        again = optimize(negloglik, Optim.minimizer(res), NelderMead(), Optim.Options(; iterations = 3000, f_reltol = 1e-10))
+        again = optimize(objective, Optim.minimizer(res), NelderMead(), Optim.Options(; iterations = 3000, f_reltol = 1e-10))
         improved = Optim.minimum(res) - Optim.minimum(again)
         res = again
         improved < 1e-6 && break
     end
     return res
 end
-best = nothing
-for (k, start) in enumerate((θ0,))
-    r = minimise(start)
-    @printf("start %d: objective %.4f (converged: %s)\n", k, Optim.minimum(r), Optim.converged(r))
-    flush(stdout)
-    global best = best === nothing || Optim.minimum(r) < Optim.minimum(best) ? r : best
+# ---- "lm": Levenberg-Marquardt on the residuals ------------------------------------------------
+# The residuals depend on the dynamic parameters only; the noise sds (obs_sd, presence_sd,
+# cluster_sd) are optimised at fixed residuals, with no integration.
+const NOISE = [8; PRESENCE ? [IPRES] : Int[]; GROUPED ? [ICLU] : Int[]; YEARSD ? [IYSD] : Int[]]
+const DYN = [k for k in FREE if !(k in NOISE)]
+const NOISEFREE = [k for k in FREE if k in NOISE]
+total(θ, fr) = (q = unpack(θ); data_nll(fr, q) - logprior(θ, q))
+function with_noise(θ, fr)
+    isempty(NOISEFREE) && return θ
+    f(x) = (ϑ = copy(θ); ϑ[NOISEFREE] = x; total(ϑ, fr))
+    x = θ[NOISEFREE]
+    for _ in 1:3
+        x = Optim.minimizer(optimize(f, x, NelderMead(), Optim.Options(; iterations = 5000, g_abstol = 1e-13)))
+    end
+    ϑ = copy(θ)
+    ϑ[NOISEFREE] = x
+    return ϑ
 end
-res = best
-θ̂ = Optim.minimizer(res)
-q̂ = unpack(θ̂)
-
-# Laplace approximation: central-difference Hessian on the unconstrained scale
+# v with sum(abs2, v)/2 the misfit's quadratic form: x/σ for independent errors; with "cluster",
+# (x - c Σx)/σ in each cell, c = (1 - sqrt(σ²/(σ² + nτ²)))/n. Linear in x, so it whitens the
+# Jacobian's columns too.
+function whiten(x, xp, fr, q)
+    k = fr.ry .!= HOLD
+    v = x[k] ./ q.sd
+    if GROUPED
+        rg = fr.rg[k]
+        for g in unique(rg)
+            m = rg .== Ref(g)
+            n = count(m)
+            c = (1 - sqrt(q.sd^2 / (q.sd^2 + n * q.cluster^2))) / n
+            v[m] .-= c * sum(v[m])
+        end
+    elseif YEARSD   # each year's weight from the current residuals (not from x, a Jacobian column)
+        ry = fr.ry[k]
+        for y in unique(ry)
+            v[ry .== y] .*= sqrt(year_nll(fr.r[k][ry .== y], q.sd, q.year_sd).w)
+        end
+    end
+    return [v; xp[fr.rpy .!= HOLD] ./ q.presence_sd]
+end
+# central differences, with the profiled days held at the current point's
+function jacobian(θ, fr, q; h = 1e-4)
+    cols = map(DYN) do k
+        e = zeros(length(θ))
+        e[k] = h
+        a, b = fitted(unpack(θ + e); pinned = fr.dates), fitted(unpack(θ - e); pinned = fr.dates)
+        whiten((a.r - b.r) ./ 2h, (a.rp - b.rp) ./ 2h, fr, q)
+    end
+    return reduce(hcat, cols)
+end
 function hessian(f, x; h = 1e-2)
     n = length(x)
     H = zeros(n, n)
@@ -544,9 +814,97 @@ function hessian(f, x; h = 1e-2)
     end
     return H
 end
-H = hessian(negloglik, θ̂)
+# the priors are quadratic in θ, so central differences give their derivatives to rounding
+function prior_derivatives(θ; h = 1e-3)
+    f(x) = (ϑ = copy(θ); ϑ[DYN] = x; -logprior(ϑ, unpack(ϑ)))
+    x = θ[DYN]
+    g = [(f(x + (eachindex(x) .== i) .* h) - f(x - (eachindex(x) .== i) .* h)) / 2h for i in eachindex(x)]
+    return g, hessian(f, x; h)
+end
+function lm(start; maxit = 300)
+    θ = copy(start)
+    fr = fitted(unpack(θ))
+    θ = with_noise(θ, fr)
+    f = total(θ, fr)
+    μ, its, gmax = 1e-3, 0, Inf
+    for _ in 1:maxit
+        q = unpack(θ)
+        J, v = jacobian(θ, fr, q), whiten(fr.r, fr.rp, fr, q)
+        gp, Hp = prior_derivatives(θ)
+        g, H = J' * v + gp, J' * J + Hp
+        gmax = maximum(abs, g)
+        its += 1
+        gain, step = -Inf, Inf
+        while μ < 1e10
+            Δ = -((H + μ * Diagonal(diag(H))) \ g)
+            θt = copy(θ)
+            θt[DYN] += Δ
+            frt = try
+                fitted(unpack(θt))   # the days are profiled afresh
+            catch err
+                err isa PowderyMildewError || rethrow()
+                nothing
+            end
+            if frt !== nothing
+                θt = with_noise(θt, frt)
+                ft = total(θt, frt)
+                if ft < f
+                    gain, step = f - ft, norm(Δ)
+                    θ, fr, f = θt, frt, ft
+                    μ = max(μ / 10, 1e-12)
+                    break
+                end
+            end
+            μ *= 10
+        end
+        (gain < 1e-9 || step < 1e-7) && break   # no step lowers it (gain = -Inf), or the last one was negligible
+    end
+    return (; θ, f, its, gmax)
+end
+
+if LM
+    rng = MersenneTwister(1)
+    found = nothing
+    for k in 1:parse(Int, get(ENV, "LM_STARTS", "3"))
+        start = copy(θ0)
+        # jittered starts: log-sd 0.3 on the dynamic parameters (3 days on the release lag)
+        k > 1 && (start[DYN] .+= [j == 6 ? 3.0 : 0.3 for j in DYN] .* randn(rng, length(DYN)))
+        t = @elapsed out = try
+            lm(start)
+        catch err
+            err isa PowderyMildewError || rethrow()
+            nothing
+        end
+        out === nothing && (println("start $k: the model failed at the start"); continue)
+        @printf("start %d: objective %.6f after %d iterations (%.0f s), largest gradient entry %.2g\n", k, out.f, out.its, t, out.gmax)
+        flush(stdout)
+        global found = found === nothing || out.f < found.f ? out : found
+    end
+    θ̂, fmin = found.θ, found.f
+else
+    best = nothing
+    for (k, start) in enumerate((θ0,))
+        r = minimise(start)
+        @printf("start %d: objective %.4f (converged: %s)\n", k, Optim.minimum(r), Optim.converged(r))
+        flush(stdout)
+        global best = best === nothing || Optim.minimum(r) < Optim.minimum(best) ? r : best
+    end
+    θ̂, fmin = expand(Optim.minimizer(best)), Optim.minimum(best)
+end
+q̂ = unpack(θ̂)
+
+# Laplace approximation: central-difference Hessian on the unconstrained scale (over the free
+# parameters; a held one has no interval). With "lm" the profiled days are held at the optimum's,
+# which makes the objective smooth, and the step is smaller.
+H = if LM
+    days = fitted(q̂).dates
+    hessian(φ -> (θ = expand(φ); total(θ, fitted(unpack(θ); pinned = days))), θ̂[FREE]; h = 2e-3)
+else
+    hessian(objective, θ̂[FREE])
+end
 Σ = inv(Symmetric(H))
-se = sqrt.(max.(diag(Σ), 0))
+se = zeros(length(θ̂))
+se[FREE] = sqrt.(max.(diag(Σ), 0))
 
 fit = fitted(q̂)
 pred, sols = fit.pred, fit.sols
@@ -562,16 +920,41 @@ end
 # the likelihood without the priors, for comparing variants whose priors differ ("tauprior"),
 # and information criteria with the Gaussian constant (the profiled days of the undated scores,
 # the same in every variant with "dates", are not counted)
-nobs, npar = length(fit.r) + length(fit.rp), length(θ̂)
+nobs = count(!=(HOLD), fit.ry) + count(!=(HOLD), fit.rpy)
+npar = length(FREE)
 nll = data_nll(fit, q̂; constant = true)
 open(joinpath(OUT, "fit.txt"), "w") do io
     for out in (stdout, io)
         @printf(out, "variant %s: %d plot means%s\n", VARIANT, length(fit.r),
                 PRESENCE ? @sprintf(" and %d presence scores (link cloglog p = %.3f + %.3f log v, from %d scorings)",
                                     length(fit.rp), PRESENCE_LINK.a, PRESENCE_LINK.b, PRESENCE_LINK.n) : "")
-        @printf(out, "objective %.4f; Hessian eigenvalues %.3g to %.3g\n", Optim.minimum(res), extrema(eigvals(Symmetric(H)))...)
+        @printf(out, "objective %.4f; Hessian eigenvalues %.3g to %.3g\n", fmin, extrema(eigvals(Symmetric(H)))...)
         @printf(out, "-log likelihood %.4f (with the Gaussian constant), -log prior %.4f; %d parameters, AIC %.2f, BIC %.2f\n",
                 nll, -logprior(θ̂, q̂), npar, 2nll + 2npar, 2nll + npar * log(nobs))
+        isempty(FIXED) || println(out, "held fixed: ", join((@sprintf("%s = %.4g", NAMES[k], v) for (k, v) in sort(collect(FIXED))), ", "))
+        if HOLD != 0
+            rh, rph = fit.r[fit.ry .== HOLD], fit.rp[fit.rpy .== HOLD]
+            @printf(out, "held out %d (%d plot means, %d presence scores): -log predictive density %.4f (with the Gaussian constant), sum of squared logit residuals %.2f%s; fitted on %d scores\n",
+                    HOLD, length(rh), length(rph), data_nll(fit, q̂; constant = true, held = true), sum(abs2, rh),
+                    isempty(rph) ? "" : @sprintf(", of cloglog presence residuals %.2f", sum(abs2, rph)), nobs)
+        end
+        if GROUPED   # each group's offset, its posterior mean τ² Σr / (σ² + n τ²) from the fitted residuals, logit scale
+            fitd = fit.ry .!= HOLD
+            label(g) = CLUSTER ? @sprintf("%d %s", g...) : PLOTYEAR ? @sprintf("%d %s%s", g[1], only(unique(fit.rt[fit.rg .== Ref(g)])), g[2]) :
+                       @sprintf("%s%s", only(unique(fit.rt[fit.rg .== Ref(g)])), g[2])
+            println(out, CLUSTER ? "year-by-treatment" : PLOTYEAR ? "plot-by-year" : "plot",
+                    " offsets (n, mean residual, estimated offset): ",
+                    join((let c = fit.r[(fit.rg .== Ref(g)) .& fitd], n = length(c)
+                              @sprintf("%s %d %.2f %.2f", label(g), n, sum(c) / n, q̂.cluster^2 * sum(c) / (q̂.sd^2 + n * q̂.cluster^2))
+                          end for g in sort(unique(fit.rg[fitd]))), "; "))
+        end
+        if YEARSD   # each year's noise sd at the posterior mode of δ, given that year's own residuals
+            println(out, "year noise sds (σ e^δ at the mode given the year's residuals; n, rms residual): ",
+                    join((let c = fit.r[fit.ry .== y]
+                              @sprintf("%d%s %.3f (%d, %.3f)", y, y == HOLD ? " held out" : "",
+                                       q̂.sd * exp(year_nll(c, q̂.sd, q̂.year_sd).δ), length(c), sqrt(sum(abs2, c) / length(c)))
+                          end for y in YEARS), "; "))
+        end
         @printf(out, "sum of squared logit residuals %.2f; by treatment L %.2f (%d), M %.2f (%d), H %.2f (%d); by year %s\n",
                 sum(abs2, fit.r),
                 Iterators.flatten((sum(abs2, fit.r[i] for i in eachindex(labels) if labels[i][2] == t),
@@ -580,10 +963,15 @@ open(joinpath(OUT, "fit.txt"), "w") do io
                                count(l -> l[1] == y, labels)) for y in YEARS), ", "))
         println(out, "optimum on the unconstrained scale: ", θ̂)
         println(out, "parameter          estimate   (95% interval from the Laplace approximation)")
-        tr = [k == 6 || NAMES[k] in ("humidity", "rain") ? identity : startswith(NAMES[k], "later") || NAMES[k] in ("epsilon", "cover0", "efficacy", "dry_release") ? logistic : exp
+        tr = [k == 6 || NAMES[k] in ("humidity", "rain") ? identity :
+              startswith(NAMES[k], "later") || startswith(NAMES[k], "efficacy") || NAMES[k] in ("epsilon", "cover0", "dry_release") ? logistic : exp
               for k in eachindex(NAMES)]
         for (k, name) in enumerate(NAMES)
-            @printf(out, "%-18s %9.4g   (%.4g, %.4g)\n", name, tr[k](θ̂[k]), tr[k](θ̂[k] - 1.96se[k]), tr[k](θ̂[k] + 1.96se[k]))
+            if haskey(FIXED, k)
+                @printf(out, "%-18s %9.4g   (held fixed)\n", name, tr[k](θ̂[k]))
+            else
+                @printf(out, "%-18s %9.4g   (%.4g, %.4g)\n", name, tr[k](θ̂[k]), tr[k](θ̂[k] - 1.96se[k]), tr[k](θ̂[k] + 1.96se[k]))
+            end
         end
         println(out, "\nyear day trt  observed (plot means, %)        model (%)")
         for y in YEARS, d in sort(unique(o.day for o in obs if o.year == y)), t in ("L", "M", "H")
